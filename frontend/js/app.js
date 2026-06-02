@@ -171,9 +171,21 @@ fileInput.addEventListener("change", () => {
 });
 
 async function handleFile(file) {
+  if (!token) {
+    alert("请先登录后再上传文件");
+    logout();
+    return;
+  }
+
   const form = new FormData();
   form.append("file", file);
   uploadZone.querySelector(".upload-inner p").textContent = "上传中...";
+
+  const sizeMb = file.size / (1024 * 1024);
+  if (sizeMb > 50) {
+    uploadZone.querySelector(".upload-inner p").textContent =
+      `上传中…（${sizeMb.toFixed(1)} MB，经 ngrok 分享时大文件可能较慢或超时）`;
+  }
 
   try {
     const res = await fetch(`${API}/api/upload`, {
@@ -181,8 +193,22 @@ async function handleFile(file) {
       headers: { Authorization: `Bearer ${token}` },
       body: form,
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "上传失败");
+    if (res.status === 401) {
+      logout();
+      throw new Error("登录已过期，请重新登录后再上传");
+    }
+    const data = await res.headers.get("content-type")?.includes("json")
+      ? await res.json()
+      : null;
+    if (!res.ok) {
+      const detail = data?.detail;
+      const msg = typeof detail === "string"
+        ? detail
+        : Array.isArray(detail)
+          ? detail.map((d) => d.msg).join("; ")
+          : "上传失败";
+      throw new Error(msg);
+    }
 
     fileId = data.file_id;
     fileMeta = data;

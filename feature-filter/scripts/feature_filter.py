@@ -1129,23 +1129,26 @@ def main():
         cn_name = get_chinese_name(feat)
 
         bins_info = {'normal': normal, 'n_normal': len(normal), 'all': ft}
+        rule1 = check_head_tail(bins_info, threshold)
+        if not rule1:
+            continue
+
+        rtype, bin_label, r_br, r_total, reason = rule1
+        pct = r_total / train_total if train_total > 0 else 0
         u_shape = check_u_shape(bins_info, train_overall)
-        rule1 = check_head_tail(bins_info, threshold) if u_shape is None else None
 
         if u_shape:
-            _, u_total, reason = u_shape
-            pct = u_total / train_total if train_total > 0 else 0
+            _, _, u_reason = u_shape
             results.append({
                 'feature': feat, 'max_bad_rate': max_br,
-                'effect_label': 'U型人工判断', 'reason': reason,
+                'effect_label': 'U型人工判断',
+                'reason': f"{reason}；{u_reason}",
                 'chinese_name': cn_name, 'sample_pct': pct,
             })
             candidate_features.add(feat)
-            print(f"  [U型] {feat}")
+            print(f"  [U型+头尾] {feat}")
 
-        elif rule1:
-            rtype, bin_label, r_br, r_total, reason = rule1
-            pct = r_total / train_total if train_total > 0 else 0
+        else:
             test_eff, test_code = evaluate_test_on_train(r_br, threshold)
             if test_code == 'good':
                 eff_label = '好'

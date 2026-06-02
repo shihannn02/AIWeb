@@ -371,19 +371,29 @@ def _analyze_feature(
     max_br = float(normal["bad_rate"].max())
     cn_name = get_chinese_name(feat)
     bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
+    rule = check_head_tail(bins_info, threshold, min_samples=min_hit)
+    if not rule:
+        return None
+
+    rtype, _bin_label, r_br, r_total, ht_reason = rule
+    hit = int(r_total)
+    if hit < min_hit:
+        return None
+
+    rule_info = _suggest_reject_rule(
+        feat, normal, threshold, min_hit,
+        rule_type=rtype, rule_bin_label=_bin_label,
+    )
     u_shape = check_u_shape(bins_info, train_overall, min_samples=min_hit)
-    rule = check_head_tail(bins_info, threshold, min_samples=min_hit) if u_shape is None else None
 
     if u_shape:
-        _, u_total, reason = u_shape
-        hit = int(u_total)
-        rule_info = _suggest_reject_rule(feat, normal, threshold, min_hit)
+        _, _, u_reason = u_shape
         return {
             "feature": feat,
             "chinese_name": cn_name,
             "max_bad_rate": max_br,
             "effect_label": "U型人工判断",
-            "reason": reason,
+            "reason": f"{ht_reason}；{u_reason}",
             "rule_type": "u_shape",
             "hit_count": hit,
             "sample_pct": hit / train_total if train_total else 0,
@@ -391,29 +401,19 @@ def _analyze_feature(
             **rule_info,
         }
 
-    if rule:
-        rtype, _bin_label, r_br, r_total, reason = rule
-        hit = int(r_total)
-        if hit < min_hit:
-            return None
-        eff = "好" if r_br >= 0.65 else ("一般" if r_br >= threshold else "不好")
-        rule_info = _suggest_reject_rule(
-            feat, normal, threshold, min_hit,
-            rule_type=rtype, rule_bin_label=_bin_label,
-        )
-        return {
-            "feature": feat,
-            "chinese_name": cn_name,
-            "max_bad_rate": max_br,
-            "effect_label": eff,
-            "reason": reason,
-            "rule_type": rtype,
-            "hit_count": hit,
-            "sample_pct": hit / train_total if train_total else 0,
-            "category_key": classify_category(cn_name, feat),
-            **rule_info,
-        }
-    return None
+    eff = "好" if r_br >= 0.65 else ("一般" if r_br >= threshold else "不好")
+    return {
+        "feature": feat,
+        "chinese_name": cn_name,
+        "max_bad_rate": max_br,
+        "effect_label": eff,
+        "reason": ht_reason,
+        "rule_type": rtype,
+        "hit_count": hit,
+        "sample_pct": hit / train_total if train_total else 0,
+        "category_key": classify_category(cn_name, feat),
+        **rule_info,
+    }
 
 
 def _threshold_overview(
@@ -436,9 +436,6 @@ def _threshold_overview(
             if len(normal) < 1:
                 continue
             bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
-            if check_u_shape(bins_info, train_overall, min_samples=min_hit):
-                count += 1
-                continue
             rule = check_head_tail(bins_info, th, min_samples=min_hit)
             if rule:
                 count += 1
