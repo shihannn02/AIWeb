@@ -1035,6 +1035,33 @@ body {
   font-weight: 600;
 }
 
+.rule-categorical {
+  color: var(--primary);
+  word-break: break-all;
+}
+
+.cat-select-table th:first-child,
+.cat-select-table td:first-child {
+  width: 3rem;
+  text-align: center;
+}
+
+.cat-select-table input[type="checkbox"] {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.cat-miss-tag {
+  font-size: .6875rem;
+  color: var(--muted);
+}
+
+.cat-select-hint {
+  margin-top: .5rem;
+}
+
 .rule-warn {
   display: block;
   font-size: .6875rem;

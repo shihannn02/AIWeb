@@ -10,12 +10,16 @@ import pandas as pd
 from services.binning_runner import get_job
 from services.data_service import read_dataframe
 from services.feature_review_service import (
-    _format_threshold,
+    _bin_sort_key,
+    _bins_for_feature_from_train_defs,
+    _feature_col,
+    _format_rule_display,
     _load_train_frame,
     _portfolio_stats,
     _prepare_stability_frames,
     _rule_hit_mask,
     get_chinese_name,
+    read_binning_sheets,
 )
 
 
@@ -51,23 +55,23 @@ def _load_train_test_full(job_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.D
     return tr, te, full
 
 
-def _rule_display(rule: Dict[str, Any]) -> str:
-    feat = rule.get("feature", "")
-    op = rule.get("operator", ">")
-    th = rule.get("threshold", 0)
-    return f"{feat}{op}{_format_threshold(th)}"
-
-
 def _enrich_rules(full_df: pd.DataFrame, rules: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     enriched: List[Dict[str, Any]] = []
     for r in rules:
+        op = r.get("operator", ">")
+        if op == "in" and not r.get("values"):
+            continue
         mask = _rule_hit_mask(
-            full_df, r["feature"], r.get("operator", ">"), float(r.get("threshold", 0))
+            full_df,
+            r["feature"],
+            op,
+            float(r.get("threshold", 0)),
+            values=r.get("values"),
         )
         stats = _portfolio_stats(full_df[mask])
         enriched.append({
             **r,
-            "rule_display": _rule_display(r),
+            "rule_display": _format_rule_display(r),
             "chinese_name": get_chinese_name(r.get("feature", "")),
             "full_hit": stats["count"],
             "full_bad_rate": stats["bad_rate"],
@@ -122,7 +126,11 @@ def _serial_on_df(
 
     for rule in ordered_rules:
         hit_all = _rule_hit_mask(
-            df, rule["feature"], rule.get("operator", ">"), float(rule.get("threshold", 0))
+            df,
+            rule["feature"],
+            rule.get("operator", ">"),
+            float(rule.get("threshold", 0)),
+            values=rule.get("values"),
         )
         hit_serial = hit_all & remaining
 
@@ -217,6 +225,7 @@ def build_serial_analysis(
             "rule_display": rule["rule_display"],
             "operator": rule.get("operator", ">"),
             "threshold": float(rule.get("threshold", 0)),
+            "values": rule.get("values"),
             "status": status,
             "drop_reason": ts.get("drop_reason", ""),
             "train": {k: ts[k] for k in ts if k not in ("dropped", "drop_reason")},
@@ -249,7 +258,12 @@ def _segment_detail_rows(rules: List[Dict[str, Any]], key: str) -> List[Dict[str
         serial_hit = seg.get("serial_hit") or 0
         rows.append({
             "序号": r["order"],
-            "规则名称": r["rule_display"],
+            "规则名称": _format_rule_display({
+                "feature": r["feature"],
+                "operator": r.get("operator", ">"),
+                "threshold": r.get("threshold", 0),
+                "values": r.get("values"),
+            }, full=True),
             "中文名": r.get("chinese_name", ""),
             "状态": "丢弃" if r["status"] == "dropped" else "应用",
             "丢弃原因": r.get("drop_reason", "") if r["status"] == "dropped" else "",
@@ -268,7 +282,179 @@ def _segment_detail_rows(rules: List[Dict[str, Any]], key: str) -> List[Dict[str
     return rows
 
 
-def export_serial_excel(analysis: Dict[str, Any]) -> bytes:
+def _job_has_test_split(job) -> bool:
+    params = job.run_params or {}
+    if params.get("split_mode") == "manual" and params.get("test_file_path"):
+        return True
+    if params.get("split_mode") == "cutoff" and params.get("cutoff_date"):
+        return True
+    if params.get("split_mode") == "ai" and float(params.get("oot_ratio", 0.2)) > 0:
+        return True
+    return False
+
+
+def _bin_col_name(df: pd.DataFrame) -> str:
+    if "Bin" in df.columns:
+        return "Bin"
+    if "bin_label" in df.columns:
+        return "bin_label"
+    raise ValueError("分箱结果缺少 Bin / bin_label 列")
+
+
+def _sort_binning_rows(df: pd.DataFrame, feature_order: List[str]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    col = _feature_col(df)
+    bin_col = _bin_col_name(df)
+    out = df[df[col].isin(feature_order)].copy()
+    if out.empty:
+        return out
+    out["_feat_order"] = pd.Categorical(out[col], categories=feature_order, ordered=True)
+    out["_bin_order"] = out[bin_col].astype(str).apply(_bin_sort_key)
+    out = out.sort_values(["_feat_order", "_bin_order"]).drop(columns=["_feat_order", "_bin_order"])
+    return out.reset_index(drop=True)
+
+
+def _apply_computed_bin_stats(row: Dict[str, Any], computed: Dict[str, Any]) -> Dict[str, Any]:
+    obs = int(computed.get("obs", 0) or 0)
+    bad = int(computed.get("bad", 0) or 0)
+    br = float(computed.get("bad_rate", 0) or 0)
+    if "#Obs" in row:
+        row["#Obs"] = obs
+        row["#Bad"] = bad
+        row["%Bad_Rate"] = br
+    else:
+        row["total"] = obs
+        row["bad"] = bad
+        row["bad_rate"] = br
+    if computed.get("lift") is not None:
+        if "Lift" in row:
+            row["Lift"] = computed["lift"]
+        elif "lift" in row:
+            row["lift"] = computed["lift"]
+    return row
+
+
+def _build_full_binning_sheet(
+    job_id: str,
+    feature_order: List[str],
+    train_raw: pd.DataFrame,
+) -> pd.DataFrame:
+    """用 Train 分箱边界在全量样本上重算，输出与 Train 表相同列结构（含全部类别/分箱）。"""
+    job = get_job(job_id)
+    if not job:
+        return pd.DataFrame()
+    if not _job_has_test_split(job):
+        return _sort_binning_rows(train_raw, feature_order)
+
+    _, _, full = _load_train_test_full(job_id)
+    if full.empty:
+        return pd.DataFrame()
+
+    col = _feature_col(train_raw)
+    bin_col = _bin_col_name(train_raw)
+    chunks: List[pd.DataFrame] = []
+    for feat in feature_order:
+        feat_rows = train_raw[train_raw[col] == feat].copy()
+        if feat_rows.empty:
+            continue
+        feat_rows = feat_rows.copy()
+        feat_rows["_sort"] = feat_rows[bin_col].astype(str).apply(_bin_sort_key)
+        feat_rows = feat_rows.sort_values("_sort").drop(columns="_sort")
+        computed = _bins_for_feature_from_train_defs(full, train_raw, feat)
+        by_bin = {str(c["bin"]): c for c in computed}
+        rebuilt = []
+        for _, r in feat_rows.iterrows():
+            bl = str(r[bin_col])
+            rebuilt.append(_apply_computed_bin_stats(r.to_dict(), by_bin.get(bl, {})))
+        chunks.append(pd.DataFrame(rebuilt))
+    if not chunks:
+        return pd.DataFrame()
+    return pd.concat(chunks, ignore_index=True)
+
+
+def _load_selected_binning_sheets(
+    job_id: str,
+    feature_order: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    job = get_job(job_id)
+    if not job or not job.output_path or not job.output_path.exists():
+        raise ValueError("分箱任务不存在或分箱结果文件已丢失，请重新执行分箱")
+    train_raw, test_raw = read_binning_sheets(str(job.output_path))
+    train_sel = _sort_binning_rows(train_raw, feature_order)
+    test_sel = _sort_binning_rows(test_raw, feature_order) if test_raw is not None else pd.DataFrame()
+    if test_sel.empty and not train_sel.empty:
+        test_sel = pd.DataFrame(columns=train_sel.columns)
+    full_sel = _build_full_binning_sheet(job_id, feature_order, train_raw)
+    return train_sel, test_sel, full_sel
+
+
+def _bad_rate_col_index(df: pd.DataFrame) -> Optional[int]:
+    for name in ("%Bad_Rate", "bad_rate"):
+        if name in df.columns:
+            return int(df.columns.get_loc(name))
+    return None
+
+
+def _feature_col_for_format(df: pd.DataFrame) -> Optional[str]:
+    for name in ("feature", "变量英文名"):
+        if name in df.columns:
+            return name
+    return None
+
+
+def _write_formatted_binning_sheet(
+    writer: pd.ExcelWriter,
+    workbook,
+    df: pd.DataFrame,
+    sheet_name: str,
+) -> None:
+    """与第3步分箱导出一致：bad_rate 数据条 + 按变量灰白交替背景。"""
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+    if df is None or df.empty:
+        return
+    ws = writer.sheets[sheet_name]
+    br_col = _bad_rate_col_index(df)
+    if br_col is not None:
+        ws.conditional_format(1, br_col, len(df), br_col, {
+            "type": "data_bar",
+            "bar_color": "#5DADE2",
+            "bar_solid": True,
+        })
+    feat_col = _feature_col_for_format(df)
+    if not feat_col:
+        return
+    fmt_gray = workbook.add_format({"bg_color": "#EBEBEB"})
+    fmt_white = workbook.add_format({"bg_color": "#FFFFFF"})
+    color_flag = 0
+    prev_feature = None
+    for i, feat in enumerate(df[feat_col].tolist()):
+        if feat != prev_feature:
+            color_flag = 1 - color_flag
+            prev_feature = feat
+        ws.set_row(i + 1, None, fmt_gray if color_flag else fmt_white)
+
+
+def _collect_selected_features(
+    rules: List[Dict[str, Any]],
+    analysis: Dict[str, Any],
+) -> List[str]:
+    seen: set = set()
+    ordered: List[str] = []
+    for src in (rules, analysis.get("rules") or []):
+        for r in src:
+            feat = r.get("feature") if isinstance(r, dict) else None
+            if feat and feat not in seen:
+                seen.add(feat)
+                ordered.append(feat)
+    return ordered
+
+
+def export_serial_excel(
+    analysis: Dict[str, Any],
+    job_id: str,
+    selected_features: List[str],
+) -> bytes:
     summary = analysis["summary"]
     rules = analysis["rules"]
 
@@ -287,7 +473,8 @@ def export_serial_excel(analysis: Dict[str, Any]) -> bytes:
     summary_df = pd.DataFrame(summary_rows[1:], columns=summary_rows[0])
 
     buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        workbook = writer.book
         summary_df.to_excel(writer, sheet_name="汇总", index=False)
 
         for sheet_name, key in (
@@ -297,6 +484,21 @@ def export_serial_excel(analysis: Dict[str, Any]) -> bytes:
         ):
             detail_df = pd.DataFrame(_segment_detail_rows(rules, key))
             detail_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        if selected_features:
+            train_bins, test_bins, full_bins = _load_selected_binning_sheets(
+                job_id, selected_features
+            )
+            if train_bins.empty:
+                raise ValueError(
+                    "未能从第3步分箱结果中匹配到所选特征的分箱明细，"
+                    "请确认分箱文件未删除，或重新执行分箱后再导出"
+                )
+            _write_formatted_binning_sheet(writer, workbook, train_bins, "Train分箱明细")
+            _write_formatted_binning_sheet(writer, workbook, test_bins, "Test分箱明细")
+            _write_formatted_binning_sheet(writer, workbook, full_bins, "全量分箱明细")
+        else:
+            raise ValueError("导出分箱明细需要至少一条已选特征规则")
 
     buf.seek(0)
     return buf.getvalue()

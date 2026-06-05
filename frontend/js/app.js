@@ -13,7 +13,7 @@ let currentJobId = "";
 let reviewData = null;
 let selectedFeatures = new Set();
 let activeFeature = "";
-/** @type {Map<string, {operator: string, threshold: number, userEdited?: boolean}>} */
+/** @type {Map<string, {operator: string, threshold: number, values?: string[], valueType?: string, userEdited?: boolean}>} */
 const featureRules = new Map();
 let featureSortMode = "bad_rate";
 /** @type {Map<string, { ruleKey: string, hit_count: number, bad_rate: number, money_bad_rate?: number }>} */
@@ -21,6 +21,8 @@ const liveFeatureStats = new Map();
 let rejectPreviewTimer = null;
 let rejectPreviewAbort = null;
 let serialAnalysisData = null;
+/** @type {Map<string, object>} */
+const lastFeatureDetail = new Map();
 
 function normThreshold(val) {
   const n = parseFloat(val);
@@ -29,11 +31,32 @@ function normThreshold(val) {
 
 function currentRuleKey(feature) {
   const r = getFeatureRule(feature);
+  if (r.operator === "in") {
+    const vals = [...(r.values || [])].sort().join("|");
+    return `${feature}|in|${vals}`;
+  }
   return `${feature}|${r.operator}|${normThreshold(r.threshold)}`;
 }
 
-function ruleKeyFromParts(feature, operator, threshold) {
+function ruleKeyFromParts(feature, operator, threshold, values) {
+  if (operator === "in") {
+    const vals = [...(values || [])].sort().join("|");
+    return `${feature}|in|${vals}`;
+  }
   return `${feature}|${operator}|${normThreshold(threshold)}`;
+}
+
+function isCategoricalFeature(f) {
+  if (!f) return false;
+  if (typeof f === "string") {
+    const r = getFeatureRule(f);
+    if (r.operator === "in" || r.valueType === "categorical") return true;
+    const meta = findFeatureMetaByName(f);
+    return meta?.value_type === "categorical" || meta?.rule_operator === "in";
+  }
+  const r = getFeatureRule(f.feature);
+  if (r.operator === "in" || r.valueType === "categorical") return true;
+  return f.value_type === "categorical" || f.rule_operator === "in";
 }
 
 function findFeatureMetaByName(feature) {
@@ -757,15 +780,18 @@ $("#to-step-4")?.addEventListener("click", async () => {
   await loadFeatureReviewSummary();
 });
 
-$("#to-step-5")?.addEventListener("click", () => {
-  if (!reviewData?.clusters?.length) return;
+$("#to-step-5")?.addEventListener("click", async () => {
+  currentJobId = getStoredJobId();
+  if (!currentJobId) {
+    alert("请先完成分箱");
+    return;
+  }
   resetPickStage();
   setStep(5);
-  renderFeatureClusters(reviewData.clusters);
-  $("#review-count").textContent = String(reviewData.total_candidates);
-  updateSelectedCount();
-  scheduleRejectPreview();
+  await loadFeatureReviewPick();
 });
+
+$("#refresh-pick")?.addEventListener("click", () => loadFeatureReviewPick());
 
 $("#feature-sort")?.addEventListener("change", (e) => {
   featureSortMode = e.target.value;
@@ -824,33 +850,34 @@ function buildReviewQuery() {
   return params;
 }
 
-async function loadFeatureReviewSummary() {
+async function fetchReviewData() {
   const jobId = getStoredJobId();
+  if (!jobId) {
+    throw new Error("未找到分箱任务，请返回第 3 步重新执行分箱。");
+  }
+  currentJobId = jobId;
+  const query = buildReviewQuery();
+  return api(`/api/binning/${jobId}/review?${query}`, {
+    headers: headers(false),
+  });
+}
+
+async function loadFeatureReviewSummary() {
   const errEl = $("#review-error");
   errEl.classList.add("hidden");
 
-  if (!jobId) {
-    errEl.textContent = "未找到分箱任务，请返回第 3 步重新执行分箱。";
-    errEl.classList.remove("hidden");
-    return;
-  }
-
-  currentJobId = jobId;
   $("#review-summary-card").classList.remove("hidden");
   $("#review-summary-card").innerHTML = `<p class="sub">统计中...</p>`;
 
   try {
-    const query = buildReviewQuery();
-    reviewData = await api(`/api/binning/${jobId}/review?${query}`, {
-      headers: headers(false),
-    });
+    reviewData = await fetchReviewData();
     featureRules.clear();
     liveFeatureStats.clear();
     renderReviewSummaryCount(reviewData);
     renderReviewReport(reviewData);
     renderThresholdOverview(reviewData.threshold_overview);
     const btn5 = $("#to-step-5");
-    if (btn5) btn5.disabled = !reviewData.total_candidates;
+    if (btn5) btn5.disabled = false;
   } catch (err) {
     reviewData = null;
     $("#review-summary-card").classList.add("hidden");
@@ -863,6 +890,41 @@ async function loadFeatureReviewSummary() {
   }
 }
 
+async function loadFeatureReviewPick() {
+  const clustersEl = $("#feature-clusters");
+  const errEl = $("#review-error");
+  if (clustersEl) {
+    clustersEl.innerHTML = `<p class="sub">正在加载候选特征...</p>`;
+  }
+  try {
+    reviewData = await fetchReviewData();
+    featureRules.clear();
+    liveFeatureStats.clear();
+    selectedFeatures.clear();
+    if (!reviewData.total_candidates) {
+      if (clustersEl) {
+        clustersEl.innerHTML = `<p class="sub">当前阈值下无候选变量，请返回 Step 4 调低阈值或减少最少命中人数后点「刷新候选」。</p>`;
+      }
+      $("#review-count").textContent = "0";
+      updateSelectedCount();
+      return;
+    }
+    renderFeatureClusters(reviewData.clusters);
+    $("#review-count").textContent = String(reviewData.total_candidates);
+    updateSelectedCount();
+    scheduleRejectPreview();
+    if (errEl) errEl.classList.add("hidden");
+  } catch (err) {
+    if (clustersEl) {
+      clustersEl.innerHTML = `<p class="error">${err.message}</p>`;
+    }
+    if (errEl) {
+      errEl.textContent = err.message;
+      errEl.classList.remove("hidden");
+    }
+  }
+}
+
 function renderReviewSummaryCount(data) {
   const el = $("#review-summary-card");
   el.classList.remove("hidden");
@@ -871,7 +933,7 @@ function renderReviewSummaryCount(data) {
       <span class="count-num">${data.total_candidates}</span>
       <span class="count-label">个特征满足当前条件</span>
     </div>
-    <p class="sub count-hint">条件：头/尾箱坏率 &gt; ${pct(data.bad_rate_threshold)}，且单箱命中 ≥ ${data.min_hit_count} 人</p>
+    <p class="sub count-hint">条件：坏率 &gt; ${pct(data.bad_rate_threshold)} 且单箱命中 ≥ ${data.min_hit_count} 人（<strong>数字列</strong>：头/尾箱；<strong>类别列</strong>：任一超阈值类别，明细中勾选拒绝）</p>
   `;
 }
 
@@ -887,7 +949,7 @@ function renderReviewReport(data) {
       <div><dt>当前阈值</dt><dd>${pct(data.bad_rate_threshold)}</dd></div>
       <div><dt>最少命中</dt><dd>${data.min_hit_count} 人</dd></div>
     </dl>
-    <p class="warn" style="margin-top:.75rem">头尾拒绝最少命中人数设多少合适？若业务要能稳定拒绝一批客群，建议 ≥10；若只抓极端高风险，可提高到 20–50。</p>
+    <p class="warn" style="margin-top:.75rem">最少命中人数：数值变量指头/尾箱样本量，类别变量指单个超阈值类别的样本量。建议 ≥10；只抓极端高风险可提高到 20–50。</p>
   `;
 }
 
@@ -956,8 +1018,17 @@ function getPreviewRules(forceFeature) {
     : [(forceFeature || activeFeature)].filter(Boolean);
   return feats.map((f) => {
     const r = getFeatureRule(f);
-    return { feature: f, operator: r.operator, threshold: r.threshold };
-  });
+    const rule = {
+      feature: f,
+      operator: r.operator,
+      threshold: Number(r.threshold) || 0,
+    };
+    if (r.operator === "in") {
+      rule.values = [...(r.values || [])];
+      if (!rule.values.length) return null;
+    }
+    return rule;
+  }).filter(Boolean);
 }
 
 function renderImpactCard(data, rules) {
@@ -1042,7 +1113,7 @@ async function refreshRejectPreview(forceFeature) {
     if (JSON.stringify(getPreviewRules(forceFeature)) !== rulesSnapshot) return;
 
     for (const pr of data.per_rule || []) {
-      const rk = ruleKeyFromParts(pr.feature, pr.operator, pr.threshold);
+      const rk = ruleKeyFromParts(pr.feature, pr.operator, pr.threshold, pr.values);
       liveFeatureStats.set(pr.feature, {
         ruleKey: rk,
         hit_count: pr.hit_count,
@@ -1106,24 +1177,49 @@ function getReviewThreshold() {
 function initFeatureRule(f) {
   const cur = featureRules.get(f.feature);
   if (cur?.userEdited) return;
+  if (f.value_type === "categorical" || f.rule_operator === "in") {
+    const keepValues = cur?.values?.length ? cur.values : (f.rule_values || []);
+    featureRules.set(f.feature, {
+      operator: "in",
+      threshold: 0,
+      values: [...keepValues],
+      valueType: "categorical",
+    });
+    return;
+  }
   featureRules.set(f.feature, {
     operator: f.rule_operator || ">",
     threshold: f.rule_threshold ?? 0,
+    valueType: "numeric",
   });
 }
 
-function formatRuleDisplay(feature, operator, threshold) {
+function formatRuleDisplay(feature, operator, threshold, values) {
+  if (operator === "in") {
+    const vals = values || [];
+    if (!vals.length) return `${feature} in (请勾选类别)`;
+    const shown = vals.slice(0, 6).join(", ");
+    const suffix = vals.length > 6 ? `, …共${vals.length}类` : "";
+    return `${feature} in (${shown}${suffix})`;
+  }
   const t = Number.isInteger(threshold) ? String(threshold) : String(threshold);
   return `${feature}${operator}${t}`;
 }
 
 function getFeatureRule(feature) {
-  return featureRules.get(feature) || { operator: ">", threshold: 0 };
+  return featureRules.get(feature) || { operator: ">", threshold: 0, values: [] };
 }
 
 function renderFeatureRuleLine(f) {
   initFeatureRule(f);
   const rule = getFeatureRule(f.feature);
+  if (isCategoricalFeature(f)) {
+    return `
+      <div class="feature-rule-line" data-feature="${f.feature}">
+        <span class="rule-base rule-categorical">${formatRuleDisplay(f.feature, "in", 0, rule.values)}</span>
+      </div>
+    `;
+  }
   const ops = ["<", "<=", ">", ">="];
   return `
     <div class="feature-rule-line" data-feature="${f.feature}">
@@ -1135,6 +1231,40 @@ function renderFeatureRuleLine(f) {
         value="${rule.threshold}" step="any" aria-label="拒绝阈值" />
     </div>
   `;
+}
+
+function refreshFeatureRuleLine(feature) {
+  const meta = findFeatureMetaByName(feature);
+  if (!meta) return;
+  const row = document.querySelector(`.feature-row[data-feature="${CSS.escape(feature)}"]`);
+  const line = row?.querySelector(".feature-rule-line");
+  if (!line) return;
+  const tmp = document.createElement("div");
+  tmp.innerHTML = renderFeatureRuleLine(meta);
+  line.replaceWith(tmp.firstElementChild);
+}
+
+function onCategorySelectionChange(feature, bin, checked) {
+  const cur = getFeatureRule(feature);
+  const vals = new Set(cur.values || []);
+  if (checked) vals.add(bin);
+  else vals.delete(bin);
+  featureRules.set(feature, {
+    ...cur,
+    operator: "in",
+    threshold: 0,
+    values: [...vals],
+    valueType: "categorical",
+    userEdited: true,
+  });
+  liveFeatureStats.delete(feature);
+  refreshFeatureRuleLine(feature);
+  if (activeFeature === feature) {
+    const r = getFeatureRule(feature);
+    $("#detail-title").textContent = formatRuleDisplay(feature, "in", 0, r.values);
+  }
+  updateFeatureLiveDisplays();
+  scheduleRejectPreview(feature);
 }
 
 function effectClass(label) {
@@ -1161,7 +1291,8 @@ function renderFeatureClusters(clusters) {
           <div class="feature-row-main">
             ${renderFeatureRuleLine(f)}
             <span class="cn">${f.chinese_name}</span>
-            ${!f.rule_meets_min_hit ? '<span class="rule-warn">建议规则样本偏少，请结合明细调整</span>' : ""}
+            ${f.value_type === "categorical" ? '<span class="rule-warn">类别变量：请在明细中勾选要拒绝的类别</span>' : ""}
+            ${f.value_type !== "categorical" && !f.rule_meets_min_hit ? '<span class="rule-warn">建议规则样本偏少，请结合明细调整</span>' : ""}
           </div>
           <div class="feature-row-meta">
             <span class="rate">${pct(getFeatureBadRate(f))}</span>
@@ -1189,8 +1320,20 @@ function renderFeatureClusters(clusters) {
     const feat = row.dataset.feature;
     row.querySelector('input[type="checkbox"]').addEventListener("click", (e) => {
       e.stopPropagation();
-      if (e.target.checked) selectedFeatures.add(feat);
-      else selectedFeatures.delete(feat);
+      if (e.target.checked) {
+        selectedFeatures.add(feat);
+        const meta = findFeatureMeta(feat);
+        if (meta?.value_type === "categorical" && !getFeatureRule(feat).userEdited) {
+          const bins = resolveHighBadBins(feat);
+          if (setCategoricalAllSelected(feat, bins)) {
+            refreshFeatureRuleLine(feat);
+            syncCategoricalDetailCheckboxes(feat);
+          }
+        }
+      } else {
+        selectedFeatures.delete(feat);
+        featureRules.delete(feat);
+      }
       updateSelectedCount();
       scheduleRejectPreview(feat);
     });
@@ -1266,22 +1409,55 @@ async function openFeatureDetail(feature, skipSplitAnim = false) {
       `/api/binning/${getStoredJobId()}/feature-detail?${query}`,
       { headers: headers(false) }
     );
+    lastFeatureDetail.set(feature, data);
     if (data.rule) {
       const cur = getFeatureRule(feature);
       if (!cur.userEdited) {
-        featureRules.set(feature, {
-          operator: data.rule.rule_operator || ">",
-          threshold: data.rule.rule_threshold ?? 0,
-        });
-        syncRuleInputs(feature);
+        if (data.value_type === "categorical") {
+          if (!selectedFeatures.has(feature)) {
+            featureRules.set(feature, {
+              operator: "in",
+              threshold: 0,
+              values: [...(data.rule.rule_values || [])],
+              valueType: "categorical",
+            });
+          }
+        } else {
+          featureRules.set(feature, {
+            operator: data.rule.rule_operator || ">",
+            threshold: data.rule.rule_threshold ?? 0,
+            valueType: "numeric",
+          });
+          syncRuleInputs(feature);
+        }
       }
     }
     const meta = findFeatureMeta(feature);
+    const curRule = getFeatureRule(feature);
+    const subHint = data.value_type === "categorical"
+      ? (selectedFeatures.has(feature)
+        ? (curRule.userEdited
+          ? "已手动调整拒绝类别，切换其他变量后再回来仍会保留"
+          : "已勾选该变量：下方超阈值类别默认全选，可取消不需要的")
+        : "勾选左侧变量后，下方超阈值类别将默认全选")
+      : `建议箱 ${data.rule?.rule_source_bin || ""}`;
+    $("#detail-subtitle").textContent = `${data.chinese_name} · ${meta?.reason || ""} · ${subHint}`;
+    renderBinTables(data, threshold);
+    if (data.value_type === "categorical" && selectedFeatures.has(feature)) {
+      const cur = getFeatureRule(feature);
+      // 仅首次勾选且尚未选类别时默认全选；手动取消过的不再覆盖
+      if (!cur.userEdited && !(cur.values?.length)) {
+        const bins = highBadBinsFromDetail(data);
+        if (setCategoricalAllSelected(feature, bins)) {
+          refreshFeatureRuleLine(feature);
+        }
+      }
+      syncCategoricalDetailCheckboxes(feature);
+    }
     const r = getFeatureRule(feature);
-    $("#detail-title").textContent = data.rule?.rule_display
-      || formatRuleDisplay(feature, r.operator, r.threshold);
-    $("#detail-subtitle").textContent = `${data.chinese_name} · ${meta?.reason || ""} · 建议箱 ${data.rule?.rule_source_bin || ""}`;
-    renderBinTables(data.bins, threshold);
+    $("#detail-title").textContent = data.value_type === "categorical"
+      ? formatRuleDisplay(feature, "in", 0, r.values)
+      : (data.rule?.rule_display || formatRuleDisplay(feature, r.operator, r.threshold));
     renderStabilityTables(data.stability, data.stability_note, data.stability_check);
     scheduleRejectPreview();
   } catch (err) {
@@ -1308,8 +1484,71 @@ function findFeatureMeta(feature) {
   return null;
 }
 
-function renderBinTables(bins, badRateThreshold) {
+function highBadBinsFromMeta(feature) {
+  const meta = findFeatureMeta(feature);
+  return (meta?.high_bad_categories || []).map((c) => String(c.bin));
+}
+
+function highBadBinsFromDetail(detail) {
+  return (detail?.high_bad_categories || []).map((c) => String(c.bin));
+}
+
+function highBadBinsFromDetailPanel(feature) {
+  return [...document.querySelectorAll(`.cat-bin-select[data-feature="${CSS.escape(feature)}"]`)]
+    .map((cb) => cb.dataset.bin)
+    .filter(Boolean);
+}
+
+function resolveHighBadBins(feature) {
+  const fromMeta = highBadBinsFromMeta(feature);
+  if (fromMeta.length) return fromMeta;
+  const cached = lastFeatureDetail.get(feature);
+  if (cached) {
+    const fromCache = highBadBinsFromDetail(cached);
+    if (fromCache.length) return fromCache;
+  }
+  return highBadBinsFromDetailPanel(feature);
+}
+
+/** 勾选类别变量时，默认选中全部超阈值类别（首次，非手动调整后）。 */
+function setCategoricalAllSelected(feature, bins) {
+  if (!bins?.length) return false;
+  featureRules.set(feature, {
+    operator: "in",
+    threshold: 0,
+    values: [...bins],
+    valueType: "categorical",
+    userEdited: false,
+  });
+  return true;
+}
+
+function syncCategoricalDetailCheckboxes(feature) {
+  if (activeFeature !== feature) return;
+  const r = getFeatureRule(feature);
+  const selected = new Set(r.values || []);
+  $("#detail-title").textContent = formatRuleDisplay(feature, "in", 0, r.values);
+  document.querySelectorAll(`.cat-bin-select[data-feature="${CSS.escape(feature)}"]`).forEach((cb) => {
+    const bin = cb.dataset.bin;
+    cb.checked = selected.has(bin) || [...selected].some((v) => String(v) === String(bin));
+  });
+  const hint = $("#detail-bins")?.querySelector(".cat-select-hint");
+  const n = selected.size;
+  if (hint) {
+    hint.textContent = n
+      ? `已选 ${n} 个类别（默认全选，可取消不需要的）`
+      : "尚未勾选类别";
+  }
+}
+
+function renderBinTables(detail, badRateThreshold) {
   const el = $("#detail-bins");
+  if (detail.value_type === "categorical") {
+    renderCategoricalBinTables(el, detail, badRateThreshold);
+    return;
+  }
+
+  const bins = detail.bins || {};
   const trainRows = bins.train || [];
   const testRows = bins.test || [];
   const binCount = trainRows.length;
@@ -1330,6 +1569,83 @@ function renderBinTables(bins, badRateThreshold) {
       </div>
     </div>
   `;
+}
+
+function renderCategoricalBinTables(el, detail, badRateThreshold) {
+  const feature = detail.feature;
+  const categories = detail.high_bad_categories || [];
+  const rule = getFeatureRule(feature);
+  const selected = new Set(rule.values || []);
+  const bins = detail.bins || {};
+  const testByBin = Object.fromEntries((bins.test || []).map((r) => [r.bin, r]));
+
+  if (!categories.length) {
+    el.innerHTML = `<p class="sub">当前阈值下没有坏率 &gt; ${pct(badRateThreshold)} 的类别。</p>`;
+    return;
+  }
+
+  el.innerHTML = `
+    <p class="sub bin-hint">仅展示坏率 &gt; ${pct(badRateThreshold)} 的类别（样本 ≥ 10）。请勾选要纳入拒绝规则的类别；未勾选的不拒绝。</p>
+    <table class="data-table bin-detail-table cat-select-table">
+      <thead>
+        <tr>
+          <th>拒绝</th>
+          <th>类别</th>
+          <th>Train #Obs</th>
+          <th>Train 坏率</th>
+          <th>Test #Obs</th>
+          <th>Test 坏率</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${categories.map((c) => {
+          const testRow = testByBin[c.bin] || {};
+          const missTag = c.is_missing ? ' <span class="cat-miss-tag">缺失</span>' : "";
+          return `
+          <tr class="bin-high-bad">
+            <td>
+              <input type="checkbox" class="cat-bin-select" data-feature="${feature}" data-bin="${escapeAttr(c.bin)}"
+                ${selected.has(c.bin) || [...selected].some((v) => String(v) === String(c.bin)) ? "checked" : ""} aria-label="拒绝类别 ${escapeAttr(c.bin)}" />
+            </td>
+            <td>${escapeHtml(c.bin)}${missTag}</td>
+            <td>${c.obs}</td>
+            <td class="bar-col">${renderRateBar(c.bad_rate || 0, "bad")}</td>
+            <td>${testRow.obs ?? "—"}</td>
+            <td class="bar-col">${testRow.obs ? renderRateBar(testRow.bad_rate || 0, "bad") : "—"}</td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
+    <p class="sub cat-select-hint">${selected.size
+      ? `已选 ${selected.size} 个类别（默认全选，可取消不需要的）`
+      : "勾选左侧变量后，此处将默认全选超阈值类别"}</p>
+  `;
+
+  el.querySelectorAll(".cat-bin-select").forEach((cb) => {
+    cb.addEventListener("change", (e) => {
+      e.stopPropagation();
+      onCategorySelectionChange(cb.dataset.feature, cb.dataset.bin, cb.checked);
+      const hint = el.querySelector(".cat-select-hint");
+      const n = getFeatureRule(feature).values?.length || 0;
+      if (hint) {
+        hint.textContent = n
+          ? `已选 ${n} 个类别`
+          : "尚未勾选类别，勾选左侧变量后请在明细中选择要拒绝的类别";
+      }
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function escapeAttr(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
 
 function renderBinTable(rows, badRateThreshold, binTemplate) {
@@ -1462,12 +1778,17 @@ function buildSelectedRules() {
   syncRulesFromReview();
   return [...selectedFeatures].map((feat) => {
     const r = getFeatureRule(feat);
-    return {
+    const rule = {
       feature: feat,
       operator: r.operator,
-      threshold: Number(r.threshold),
+      threshold: Number(r.threshold) || 0,
     };
-  });
+    if (r.operator === "in") {
+      rule.values = [...(r.values || [])];
+      if (!rule.values.length) return null;
+    }
+    return rule;
+  }).filter(Boolean);
 }
 
 function syncRulesFromReview() {
@@ -1476,10 +1797,21 @@ function syncRulesFromReview() {
     const meta = findFeatureMetaByName(feat);
     const cur = featureRules.get(feat);
     if (meta && !cur?.userEdited) {
-      featureRules.set(feat, {
-        operator: meta.rule_operator || ">",
-        threshold: meta.rule_threshold ?? 0,
-      });
+      if (meta.value_type === "categorical" || meta.rule_operator === "in") {
+        const keepValues = cur?.values?.length ? cur.values : (meta.rule_values || []);
+        featureRules.set(feat, {
+          operator: "in",
+          threshold: 0,
+          values: [...keepValues],
+          valueType: "categorical",
+        });
+      } else {
+        featureRules.set(feat, {
+          operator: cur?.operator || meta.rule_operator || ">",
+          threshold: cur?.threshold ?? meta.rule_threshold ?? 0,
+          valueType: "numeric",
+        });
+      }
     }
   }
 }
@@ -1496,6 +1828,21 @@ function buildSerialRequestBody() {
 $("#to-step-6")?.addEventListener("click", async () => {
   if (!selectedFeatures.size) {
     alert("请至少勾选一个特征");
+    return;
+  }
+  const rules = buildSelectedRules();
+  const missingCategorical = [...selectedFeatures].filter((feat) => {
+    const meta = findFeatureMetaByName(feat);
+    if (!meta || meta.value_type !== "categorical") return false;
+    const r = getFeatureRule(feat);
+    return r.operator === "in" && !(r.values?.length);
+  });
+  if (missingCategorical.length) {
+    alert(`以下类别变量尚未选择要拒绝的类别：${missingCategorical.join("、")}`);
+    return;
+  }
+  if (!rules.length) {
+    alert("请至少勾选一个有效规则");
     return;
   }
   setStep(6);

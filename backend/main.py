@@ -17,7 +17,11 @@ from services.feature_review_service import (
     evaluate_reject_preview,
     get_feature_detail,
 )
-from services.serial_strategy_service import build_serial_analysis, export_serial_excel
+from services.serial_strategy_service import (
+    _collect_selected_features,
+    build_serial_analysis,
+    export_serial_excel,
+)
 from services.data_service import (
     get_upload_path,
     guess_best_label,
@@ -38,6 +42,17 @@ app.add_middleware(
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+APP_BUILD = "20260605k"
+
+
+@app.middleware("http")
+async def no_cache_static_assets(request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/js/") or path.startswith("/css/") or path == "/index.html":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+    return response
 
 
 class LoginRequest(BaseModel):
@@ -98,7 +113,6 @@ async def upload_file(
     df = read_dataframe(path)
     label = guess_best_label(df)
     info = validate_dataset(df, label=label)
-    # 上传页只展示行列数，其余字段供参数配置页使用
     return {
         "file_id": file_id,
         "filename": file.filename,
@@ -253,6 +267,7 @@ class RejectRuleItem(BaseModel):
     feature: str
     operator: str = ">"
     threshold: float = 0.0
+    values: Optional[List[str]] = None
 
 
 class RejectPreviewRequest(BaseModel):
@@ -350,7 +365,11 @@ def serial_analysis_export(
             lift_min=body.lift_min,
             min_hit=body.min_hit,
         )
-        data = export_serial_excel(analysis)
+        data = export_serial_excel(
+            analysis,
+            job_id,
+            _collect_selected_features(rules, analysis),
+        )
         filename = f"serial_{job_id[:8]}.xlsx"
         return Response(
             content=data,
@@ -407,7 +426,7 @@ def download_result(job_id: str, _: str = Depends(get_current_user)):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "app_build": APP_BUILD}
 
 
 if FRONTEND_DIR.exists():

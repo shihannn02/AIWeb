@@ -89,6 +89,128 @@ def _format_threshold(val: float) -> str:
     return f"{float(val):g}"
 
 
+def _format_rule_display(rule: Dict[str, Any], *, full: bool = False) -> str:
+    feat = rule.get("feature", "")
+    op = str(rule.get("operator", ">")).strip()
+    if op == "in":
+        vals = rule.get("values") or []
+        if not vals:
+            return f"{feat} in (未选择)"
+        shown = [str(v) for v in vals] if full else [str(v) for v in vals[:6]]
+        inner = ", ".join(shown)
+        if not full and len(vals) > 6:
+            inner += f", …共{len(vals)}类"
+        return f"{feat} in ({inner})"
+    th = rule.get("threshold", 0)
+    return f"{feat}{op}{_format_threshold(float(th or 0))}"
+
+
+def _is_missing_bin_label(bl: str) -> bool:
+    s = str(bl)
+    return any(k in s for k in ("MISSING", "缺失", "nan", "NA", "特殊", "special"))
+
+
+def _is_interval_bin_label(bl: str) -> bool:
+    s = str(bl).strip()
+    if s.startswith("special("):
+        return False
+    if any(k in s for k in ("缺失", "nan", "NA", "特殊")):
+        return False
+    return s.startswith("(") or (s.startswith("[") and "," in s)
+
+
+def _is_numeric_bin_label(bl: str) -> bool:
+    s = str(bl).strip()
+    if s.startswith("special("):
+        return False
+    if _is_interval_bin_label(s):
+        return True
+    return bool(re.match(r"^-?\d+\.?\d*$", s))
+
+
+def _feature_value_type(
+    feat: str,
+    raw_df: Optional[pd.DataFrame],
+    train_norm: pd.DataFrame,
+) -> str:
+    """按原始列存储类型区分：数字列走头尾箱；object/category/string 走类别勾选。"""
+    if raw_df is not None and feat in raw_df.columns:
+        dt = raw_df[feat].dtype
+        if (
+            pd.api.types.is_object_dtype(dt)
+            or pd.api.types.is_categorical_dtype(dt)
+            or pd.api.types.is_string_dtype(dt)
+        ):
+            return "categorical"
+        return "numeric"
+
+    # 无原始数据时，根据分箱标签形态兜底
+    ft = train_norm[train_norm["feature"] == feat]
+    labels = ft["bin_label"].astype(str).tolist()
+    if not labels:
+        return "numeric"
+    interval_like = sum(1 for bl in labels if _is_interval_bin_label(bl))
+    return "numeric" if interval_like > len(labels) / 2 else "categorical"
+
+
+def _collect_high_bad_bins(
+    feature_df: pd.DataFrame,
+    threshold: float,
+    min_hit: int,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for _, r in feature_df.iterrows():
+        bl = str(r.get("bin_label", ""))
+        tot = int(r.get("total", 0) or 0)
+        br = float(r.get("bad_rate", 0) or 0)
+        if tot < min_hit or br <= threshold:
+            continue
+        rows.append({
+            "bin": bl,
+            "obs": tot,
+            "bad": int(r.get("bad", 0) or 0),
+            "bad_rate": br,
+            "is_missing": _is_missing_bin_label(bl),
+        })
+    rows.sort(key=lambda x: (-x["bad_rate"], -x["obs"], x["bin"]))
+    return rows
+
+
+def _categorical_value_matches_bin(value: Any, bin_label: str) -> bool:
+    if _is_missing_bin_label(bin_label):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return True
+        if value in SPECIAL_VALUES:
+            return True
+        return str(value).strip().upper() in ("MISSING", "NAN", "NONE", "")
+    return str(value).strip() == str(bin_label).strip()
+
+
+def _assign_categorical_bin(value: Any, bin_order: List[str]) -> Optional[str]:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        for bl in bin_order:
+            if _is_missing_bin_label(bl):
+                return bl
+        return None
+    if value in SPECIAL_VALUES:
+        for bl in bin_order:
+            if _is_missing_bin_label(bl):
+                return bl
+        return None
+    s = str(value).strip()
+    for bl in bin_order:
+        if str(bl).strip() == s:
+            return bl
+    return None
+
+
+def _bins_use_categorical(bin_order: List[str]) -> bool:
+    if not bin_order:
+        return False
+    numeric_like = sum(1 for bl in bin_order if _is_numeric_bin_label(str(bl)))
+    return numeric_like <= len(bin_order) / 2
+
+
 def _parse_rule_from_bin(
     bin_label: str,
     bin_index: int,
@@ -278,16 +400,21 @@ def _bins_for_feature_from_train_defs(
     bdefs = [(bl, parse_bin_boundary(bl)) for bl in bin_order]
 
     ds = data[[feat, "overdue_flag"]].copy()
-    ds[feat] = ds[feat].replace(SPECIAL_VALUES, np.nan)
-    ds["_bin"] = ds[feat].apply(lambda v: assign_bin(v, bdefs))
-    miss = ds[feat].isna()
-    if miss.any():
-        sp = [
-            bl for bl, m in bdefs
-            if m and ((len(m) == 3 and m[2]) or (len(m) >= 5 and m[4]))
-        ]
-        if sp:
-            ds.loc[miss, "_bin"] = sp[0]
+    bin_order = [str(bl) for bl in bin_order]
+    use_cate = _bins_use_categorical(bin_order)
+    if use_cate:
+        ds["_bin"] = ds[feat].apply(lambda v: _assign_categorical_bin(v, bin_order))
+    else:
+        ds[feat] = ds[feat].replace(SPECIAL_VALUES, np.nan)
+        ds["_bin"] = ds[feat].apply(lambda v: assign_bin(v, bdefs))
+        miss = ds[feat].isna()
+        if miss.any():
+            sp = [
+                bl for bl, m in bdefs
+                if m and ((len(m) == 3 and m[2]) or (len(m) >= 5 and m[4]))
+            ]
+            if sp:
+                ds.loc[miss, "_bin"] = sp[0]
 
     overall = float(ds["overdue_flag"].mean()) if len(ds) else 0.0
     rows: List[Dict[str, Any]] = []
@@ -355,6 +482,55 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
+def _analyze_feature_categorical(
+    feat: str,
+    train_norm: pd.DataFrame,
+    train_total: int,
+    threshold: float,
+    min_hit: int,
+) -> Optional[Dict[str, Any]]:
+    ft = train_norm[train_norm["feature"] == feat]
+    if ft.empty:
+        return None
+
+    high_bins = _collect_high_bad_bins(ft, threshold, min_hit)
+    if not high_bins:
+        return None
+
+    max_br = max(b["bad_rate"] for b in high_bins)
+    cn_name = get_chinese_name(feat)
+    bin_names = [b["bin"] for b in high_bins]
+    reason = (
+        f"共 {len(high_bins)} 个类别坏率 > {threshold:.0%}，"
+        f"最高 {max_br:.2%}（请在明细中勾选要拒绝的类别）"
+    )
+    eff = "好" if max_br >= 0.65 else ("一般" if max_br >= threshold else "不好")
+
+    return {
+        "feature": feat,
+        "chinese_name": cn_name,
+        "value_type": "categorical",
+        "max_bad_rate": max_br,
+        "effect_label": eff,
+        "reason": reason,
+        "rule_type": "categorical",
+        "hit_count": max(b["obs"] for b in high_bins),
+        "sample_pct": max(b["obs"] for b in high_bins) / train_total if train_total else 0.0,
+        "category_key": classify_category(cn_name, feat),
+        "high_bad_categories": high_bins,
+        "rule_operator": "in",
+        "rule_threshold": 0.0,
+        "rule_values": [],
+        "rule_display": _format_rule_display({
+            "feature": feat, "operator": "in", "values": [],
+        }),
+        "rule_source_bin": bin_names[0] if bin_names else "",
+        "rule_source_bad_rate": max_br,
+        "rule_source_obs": high_bins[0]["obs"] if high_bins else 0,
+        "rule_meets_min_hit": True,
+    }
+
+
 def _analyze_feature(
     feat: str,
     train_norm: pd.DataFrame,
@@ -362,7 +538,13 @@ def _analyze_feature(
     train_overall: float,
     threshold: float,
     min_hit: int,
+    value_type: str = "numeric",
 ) -> Optional[Dict[str, Any]]:
+    if value_type == "categorical":
+        return _analyze_feature_categorical(
+            feat, train_norm, train_total, threshold, min_hit
+        )
+
     ft = train_norm[train_norm["feature"] == feat]
     normal = ft[~ft["is_special"]].sort_values("min_bin").reset_index(drop=True)
     if len(normal) < 1:
@@ -391,6 +573,7 @@ def _analyze_feature(
         return {
             "feature": feat,
             "chinese_name": cn_name,
+            "value_type": "numeric",
             "max_bad_rate": max_br,
             "effect_label": "U型人工判断",
             "reason": f"{ht_reason}；{u_reason}",
@@ -405,6 +588,7 @@ def _analyze_feature(
     return {
         "feature": feat,
         "chinese_name": cn_name,
+        "value_type": "numeric",
         "max_bad_rate": max_br,
         "effect_label": eff,
         "reason": ht_reason,
@@ -416,13 +600,40 @@ def _analyze_feature(
     }
 
 
+def _feature_qualifies_at_threshold(
+    feat: str,
+    train_norm: pd.DataFrame,
+    threshold: float,
+    min_hit: int,
+    raw_df: Optional[pd.DataFrame],
+) -> Optional[int]:
+    """特征是否进入候选；返回代表命中人数（数值=头尾箱，类别=最高坏率类别样本量）。"""
+    vtype = _feature_value_type(feat, raw_df, train_norm)
+    ft = train_norm[train_norm["feature"] == feat]
+    if vtype == "categorical":
+        high = _collect_high_bad_bins(ft, threshold, min_hit)
+        if not high:
+            return None
+        return int(max(b["obs"] for b in high))
+
+    normal = ft[~ft["is_special"]].sort_values("min_bin").reset_index(drop=True)
+    if len(normal) < 1:
+        return None
+    bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
+    rule = check_head_tail(bins_info, threshold, min_samples=min_hit)
+    if not rule:
+        return None
+    return int(rule[3])
+
+
 def _threshold_overview(
     train_norm: pd.DataFrame,
     train_total: int,
     train_overall: float,
     min_hit: int,
+    raw_df: Optional[pd.DataFrame] = None,
 ) -> List[Dict[str, Any]]:
-    """在不同坏率阈值下，统计有多少特征头/尾箱可拒绝。"""
+    """在不同坏率阈值下，统计可进入候选的变量数（数值看头尾箱，类别看任一超阈值类别）。"""
     thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
     overview = []
     features = train_norm["feature"].unique()
@@ -431,23 +642,18 @@ def _threshold_overview(
         count = 0
         total_hit = 0
         for feat in features:
-            ft = train_norm[train_norm["feature"] == feat]
-            normal = ft[~ft["is_special"]].sort_values("min_bin").reset_index(drop=True)
-            if len(normal) < 1:
-                continue
-            bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
-            rule = check_head_tail(bins_info, th, min_samples=min_hit)
-            if rule:
+            hit = _feature_qualifies_at_threshold(feat, train_norm, th, min_hit, raw_df)
+            if hit is not None:
                 count += 1
-                total_hit += int(rule[3])
+                total_hit += hit
         overview.append({
             "threshold": th,
             "threshold_pct": f"{th:.0%}",
             "feature_count": count,
             "avg_hit": int(total_hit / count) if count else 0,
             "hint": (
-                f"约 {count} 个变量头/尾箱坏率 > {th:.0%}，"
-                f"且单箱命中 ≥ {min_hit} 人"
+                f"约 {count} 个变量满足条件（数值：头/尾箱；类别：任一类别）"
+                f"坏率 > {th:.0%}，且单箱 ≥ {min_hit} 人"
             ),
         })
     return overview
@@ -536,16 +742,20 @@ def _stability_table(
     bdefs = [(bl, parse_bin_boundary(bl)) for bl in bin_order]
 
     ds = data[[feature, "apply_month", "overdue_flag", "money"]].copy()
-    ds[feature] = ds[feature].replace(SPECIAL_VALUES, np.nan)
-    ds["_bin"] = ds[feature].apply(lambda v: assign_bin(v, bdefs))
-    miss = ds[feature].isna()
-    if miss.any():
-        sp = [
-            bl for bl, m in bdefs
-            if m and ((len(m) == 3 and m[2]) or (len(m) >= 5 and m[4]))
-        ]
-        if sp:
-            ds.loc[miss, "_bin"] = sp[0]
+    bin_order = [str(bl) for bl in bin_order]
+    if _bins_use_categorical(bin_order):
+        ds["_bin"] = ds[feature].apply(lambda v: _assign_categorical_bin(v, bin_order))
+    else:
+        ds[feature] = ds[feature].replace(SPECIAL_VALUES, np.nan)
+        ds["_bin"] = ds[feature].apply(lambda v: assign_bin(v, bdefs))
+        miss = ds[feature].isna()
+        if miss.any():
+            sp = [
+                bl for bl, m in bdefs
+                if m and ((len(m) == 3 and m[2]) or (len(m) >= 5 and m[4]))
+            ]
+            if sp:
+                ds.loc[miss, "_bin"] = sp[0]
 
     grp = ds.groupby(["_bin", "apply_month"]).agg(
         obs=("overdue_flag", "count"),
@@ -650,10 +860,25 @@ def build_feature_review(
     first_feat = train["feature"].iloc[0] if len(train) else None
     train_total = int(train[train["feature"] == first_feat]["total"].sum()) if first_feat else 0
 
+    raw_df: Optional[pd.DataFrame] = None
+    file_path = params.get("file_path")
+    if file_path and Path(file_path).exists():
+        try:
+            raw_df = read_dataframe(Path(file_path))
+        except Exception:
+            raw_df = None
+
     results: List[Dict[str, Any]] = []
     for feat in train["feature"].unique():
+        vtype = _feature_value_type(feat, raw_df, train)
         item = _analyze_feature(
-            feat, train, train_total, train_overall, bad_rate_threshold, min_hit_count
+            feat,
+            train,
+            train_total,
+            train_overall,
+            bad_rate_threshold,
+            min_hit_count,
+            value_type=vtype,
         )
         if item:
             results.append(item)
@@ -681,7 +906,9 @@ def build_feature_review(
         "bad_rate_threshold": bad_rate_threshold,
         "min_hit_count": min_hit_count,
         "total_candidates": len(results),
-        "threshold_overview": _threshold_overview(train, train_total, train_overall, min_hit_count),
+        "threshold_overview": _threshold_overview(
+            train, train_total, train_overall, min_hit_count, raw_df=raw_df
+        ),
         "report_summary": _build_report_text(train_overall, test_overall, bad_rate_threshold, min_hit_count, len(results)),
         "clusters": clusters,
         "params": params,
@@ -697,7 +924,8 @@ def _build_report_text(
 ) -> str:
     lines = [
         f"Train 大盘坏率 {train_br:.2%}，当前拒绝阈值 {threshold:.0%}。",
-        f"头/尾箱命中人数下限 {min_hit} 人（可在上方调整）。",
+        f"单箱最少命中 {min_hit} 人（可在上方调整）。",
+        f"数值变量（数字列）看头/尾箱，类别变量（文本/类别列）请在明细中勾选要拒绝的类别。",
         f"在该阈值下共筛出 {n_candidates} 个候选变量，请结合业务判断切割点。",
     ]
     if test_br is not None:
@@ -719,24 +947,49 @@ def get_feature_detail(
     train_raw, test_raw = read_binning_sheets(str(job.output_path))
     train_norm = normalize_cols(train_raw)
 
+    raw_df: Optional[pd.DataFrame] = None
+    file_path = params.get("file_path")
+    if file_path and Path(file_path).exists():
+        try:
+            raw_df = read_dataframe(Path(file_path))
+        except Exception:
+            raw_df = None
+
+    value_type = _feature_value_type(feature, raw_df, train_norm)
     ft = train_norm[train_norm["feature"] == feature]
     normal = ft[~ft["is_special"]].sort_values("min_bin").reset_index(drop=True)
-    bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
-    ht = check_head_tail(bins_info, bad_rate_threshold, min_samples=10)
-    if ht:
-        rtype, bin_label, _, _, _ = ht
-        rule_info = _suggest_reject_rule(
-            feature, normal, bad_rate_threshold, 10,
-            rule_type=rtype, rule_bin_label=bin_label,
-        )
+    high_bad_categories = _collect_high_bad_bins(ft, bad_rate_threshold, 10)
+
+    if value_type == "categorical":
+        rule_info = {
+            "rule_operator": "in",
+            "rule_threshold": 0.0,
+            "rule_values": [],
+            "rule_display": _format_rule_display({
+                "feature": feature, "operator": "in", "values": [],
+            }),
+            "rule_source_bin": high_bad_categories[0]["bin"] if high_bad_categories else "",
+            "rule_source_bad_rate": high_bad_categories[0]["bad_rate"] if high_bad_categories else 0.0,
+            "rule_source_obs": high_bad_categories[0]["obs"] if high_bad_categories else 0,
+            "rule_meets_min_hit": bool(high_bad_categories),
+        }
+        source_bin = rule_info.get("rule_source_bin")
     else:
-        rule_info = _suggest_reject_rule(feature, normal, bad_rate_threshold, 10)
-    source_bin = rule_info.get("rule_source_bin")
+        bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
+        ht = check_head_tail(bins_info, bad_rate_threshold, min_samples=10)
+        if ht:
+            rtype, bin_label, _, _, _ = ht
+            rule_info = _suggest_reject_rule(
+                feature, normal, bad_rate_threshold, 10,
+                rule_type=rtype, rule_bin_label=bin_label,
+            )
+        else:
+            rule_info = _suggest_reject_rule(feature, normal, bad_rate_threshold, 10)
+        source_bin = rule_info.get("rule_source_bin")
     train_bins = _bins_for_feature(
         train_raw, feature, source_bin, bad_rate_threshold
     )
 
-    file_path = params.get("file_path")
     test_bins: List[Dict[str, Any]] = []
     tr: Optional[pd.DataFrame] = None
     te: Optional[pd.DataFrame] = None
@@ -773,7 +1026,9 @@ def get_feature_detail(
     detail: Dict[str, Any] = {
         "feature": feature,
         "chinese_name": get_chinese_name(feature),
+        "value_type": value_type,
         "rule": rule_info,
+        "high_bad_categories": high_bad_categories,
         "high_bad_bins": [
             {
                 "bin": str(r["bin_label"]),
@@ -782,7 +1037,7 @@ def get_feature_detail(
             }
             for _, r in normal.iterrows()
             if float(r["bad_rate"]) > bad_rate_threshold
-        ],
+        ] if value_type == "numeric" else high_bad_categories,
         "bins": {
             "train": train_bins,
             "test": test_bins,
@@ -901,15 +1156,26 @@ def _portfolio_stats(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _rule_hit_mask(
-    df: pd.DataFrame, feature: str, operator: str, threshold: float
+    df: pd.DataFrame,
+    feature: str,
+    operator: str,
+    threshold: float = 0.0,
+    values: Optional[List[Any]] = None,
 ) -> pd.Series:
     if feature not in df.columns:
         return pd.Series(False, index=df.index)
+    op = operator.strip()
+    if op == "in":
+        if not values:
+            return pd.Series(False, index=df.index)
+        selected = [str(v) for v in values]
+        return df[feature].apply(
+            lambda v: any(_categorical_value_matches_bin(v, b) for b in selected)
+        )
     s = pd.to_numeric(
         df[feature].replace(SPECIAL_VALUES, np.nan), errors="coerce"
     )
     th = float(threshold)
-    op = operator.strip()
     if op == ">":
         return s > th
     if op == ">=":
@@ -942,7 +1208,10 @@ def evaluate_reject_preview(
         feat = r.get("feature", "")
         op = r.get("operator", ">")
         th = float(r.get("threshold", 0))
-        mask = _rule_hit_mask(tr, feat, op, th)
+        vals = r.get("values")
+        if op == "in" and not vals:
+            continue
+        mask = _rule_hit_mask(tr, feat, op, th, values=vals)
         combined |= mask
         hit_stats = _portfolio_stats(tr[mask])
         bad_n = int(tr.loc[mask, "overdue_flag"].sum()) if hit_stats["count"] else 0
@@ -950,11 +1219,12 @@ def evaluate_reject_preview(
             "feature": feat,
             "operator": op,
             "threshold": th,
+            "values": vals,
             "hit_count": hit_stats["count"],
             "bad_count": bad_n,
             "bad_rate": hit_stats["bad_rate"],
             "money_bad_rate": hit_stats["money_bad_rate"],
-            "rule_display": f"{feat}{op}{_format_threshold(th)}",
+            "rule_display": _format_rule_display(r),
         })
 
     rejected_df = tr[combined]
