@@ -16,7 +16,12 @@ import pandas as pd
 from tqdm import tqdm
 
 from config import DEFAULT_DROP_COLS, OUTPUT_DIR, SKILL_PATHS
-from services.data_service import _normalize_binary_label, read_dataframe
+from services.data_service import (
+    _coerce_time_series,
+    _normalize_binary_label,
+    _parse_cutoff_timestamp,
+    read_dataframe,
+)
 
 
 class JobStatus(str, Enum):
@@ -87,7 +92,7 @@ def _load_module(script_path: Path, module_name: str) -> types.ModuleType:
     content = script_path.read_text(encoding="utf-8")
     # Strip top-level data loading that runs on import
     content = re.sub(
-        r"file_path = .*?\noutput_file = .*?\n\n"
+        r"file_path = .*?\noutput_file = .*?\n+"
         r"data = pd\.read_(?:excel|csv)\([^\)]*\)\n"
         r"(?:df1\s*=\s*data\.copy\(\)\n"
         r"if 'product' in data\.columns:\n"
@@ -106,30 +111,69 @@ def _load_module(script_path: Path, module_name: str) -> types.ModuleType:
         content,
         count=1,
     )
+    content = re.sub(
+        r"df1 = df1\.drop\(columns=\[c for c in drop_cols if c in df1\.columns\], errors='ignore'\)[^\n]*\n",
+        "",
+        content,
+        count=1,
+    )
 
     module = types.ModuleType(module_name)
     module.__file__ = str(script_path)
     sys.modules[module_name] = module
 
-    # Stub optional imports used by binning scripts but not required at runtime
-    sklearn_mod = types.ModuleType("sklearn")
-    sklearn_model = types.ModuleType("sklearn.model_selection")
-    sklearn_model.train_test_split = lambda *args, **kwargs: (args[0], args[1]) if args else (None, None)
-    sklearn_mod.model_selection = sklearn_model
-    sys.modules["sklearn"] = sklearn_mod
-    sys.modules["sklearn.model_selection"] = sklearn_model
+    # Stub optional imports only when packages are missing (do not mask real sklearn)
+    try:
+        import sklearn.linear_model  # noqa: F401
+        import sklearn.tree  # noqa: F401
+    except ImportError:
+        sklearn_mod = types.ModuleType("sklearn")
 
-    rulelift_mod = types.ModuleType("rulelift")
-    rulelift_mod.VariableAnalyzer = object
-    rulelift_mod.load_example_data = lambda: None
-    sys.modules["rulelift"] = rulelift_mod
+        sklearn_model = types.ModuleType("sklearn.model_selection")
+        sklearn_model.train_test_split = lambda *args, **kwargs: (args[0], args[1]) if args else (None, None)
+        sklearn_mod.model_selection = sklearn_model
 
-    matplotlib_mod = types.ModuleType("matplotlib")
-    pyplot_mod = types.ModuleType("matplotlib.pyplot")
-    pyplot_mod.show = lambda: None
-    matplotlib_mod.pyplot = pyplot_mod
-    sys.modules["matplotlib"] = matplotlib_mod
-    sys.modules["matplotlib.pyplot"] = pyplot_mod
+        sklearn_linear = types.ModuleType("sklearn.linear_model")
+        sklearn_linear.LogisticRegression = object
+        sklearn_mod.linear_model = sklearn_linear
+
+        sklearn_tree = types.ModuleType("sklearn.tree")
+        sklearn_tree.DecisionTreeClassifier = object
+        sklearn_mod.tree = sklearn_tree
+
+        sklearn_metrics = types.ModuleType("sklearn.metrics")
+        sklearn_metrics.roc_curve = lambda *args, **kwargs: ([], [], [])
+        sklearn_metrics.roc_auc_score = lambda *args, **kwargs: 0.5
+        sklearn_mod.metrics = sklearn_metrics
+
+        sklearn_decomp = types.ModuleType("sklearn.decomposition")
+        sklearn_decomp.PCA = object
+        sklearn_mod.decomposition = sklearn_decomp
+
+        sys.modules["sklearn"] = sklearn_mod
+        sys.modules["sklearn.model_selection"] = sklearn_model
+        sys.modules["sklearn.linear_model"] = sklearn_linear
+        sys.modules["sklearn.tree"] = sklearn_tree
+        sys.modules["sklearn.metrics"] = sklearn_metrics
+        sys.modules["sklearn.decomposition"] = sklearn_decomp
+
+    try:
+        import rulelift  # noqa: F401
+    except ImportError:
+        rulelift_mod = types.ModuleType("rulelift")
+        rulelift_mod.VariableAnalyzer = object
+        rulelift_mod.load_example_data = lambda: None
+        sys.modules["rulelift"] = rulelift_mod
+
+    try:
+        import matplotlib.pyplot  # noqa: F401
+    except ImportError:
+        matplotlib_mod = types.ModuleType("matplotlib")
+        pyplot_mod = types.ModuleType("matplotlib.pyplot")
+        pyplot_mod.show = lambda: None
+        matplotlib_mod.pyplot = pyplot_mod
+        sys.modules["matplotlib"] = matplotlib_mod
+        sys.modules["matplotlib.pyplot"] = pyplot_mod
 
     exec(compile(content, str(script_path), "exec"), module.__dict__)
     return module
@@ -191,19 +235,26 @@ def _split_train_test(
     if split_mode == "cutoff":
         if not cutoff_date:
             raise ValueError("条件划分需要指定 cutoff_date")
-        train = df[df[time_col].astype(str) < cutoff_date].copy()
-        test = df[df[time_col].astype(str) >= cutoff_date].copy()
-        return train, test, True
+        times = _coerce_time_series(df[time_col])
+        cutoff = _parse_cutoff_timestamp(cutoff_date)
+        if times.isna().all():
+            raise ValueError(f"时间列 '{time_col}' 无法解析为日期，请检查格式")
+        train = df[times < cutoff].copy()
+        test = df[times >= cutoff].copy()
+        return train, test, len(test) > 0
 
-    # AI auto split: string sort + iloc (per zhunru SOP)
+    # AI auto split: 按解析后的时间排序再切 OOT
     if oot_ratio <= 0 or oot_ratio >= 1:
-        return df.copy(), df.copy(), False
+        return df.copy(), df.iloc[0:0].copy(), False
 
-    sorted_df = df.sort_values(time_col).reset_index(drop=True)
+    sort_key = _coerce_time_series(df[time_col])
+    sorted_df = df.assign(__sort_time=sort_key).sort_values("__sort_time").drop(
+        columns="__sort_time"
+    ).reset_index(drop=True)
     split_idx = int(len(sorted_df) * (1 - oot_ratio))
     train = sorted_df.iloc[:split_idx].copy()
     test = sorted_df.iloc[split_idx:].copy()
-    return train, test, True
+    return train, test, len(test) > 0
 
 
 def _run_quantile_or_chisquare(
@@ -439,9 +490,12 @@ OOT_RATIO = 0.2
 {label_norm}
 if time_col not in data.columns:
     raise ValueError(f'时间列 {{time_col}} 不存在，无法切分 Train/Test')
-data = data.sort_values(time_col).reset_index(drop=True)
-train_data = data[data[time_col].astype(str) < '{cutoff_date}'].copy()
-test_data = data[data[time_col].astype(str) >= '{cutoff_date}'].copy()
+_times = pd.to_datetime(data[time_col], errors='coerce')
+_cutoff = pd.to_datetime('{cutoff_date}', errors='coerce')
+if _times.isna().all() or pd.isna(_cutoff):
+    raise ValueError('时间列或 cutoff_date 无法解析为日期，请检查格式')
+train_data = data[_times < _cutoff].copy()
+test_data = data[_times >= _cutoff].copy()
 print(f'Train: {{len(train_data)}}, Test: {{len(test_data)}}')
 if len(train_data) == 0 or len(test_data) == 0:
     raise ValueError('条件切分后 Train 或 Test 为空，请检查 cutoff_date 或时间列格式')
@@ -452,7 +506,7 @@ actual_oot = True
 {label_norm}
 if time_col not in data.columns:
     raise ValueError(f'时间列 {{time_col}} 不存在，无法切分 Train/Test')
-data = data.sort_values(time_col).reset_index(drop=True)
+data = data.assign(__sort_time=pd.to_datetime(data[time_col], errors='coerce')).sort_values('__sort_time').drop(columns='__sort_time').reset_index(drop=True)
 split_idx = int(len(data) * (1 - OOT_RATIO))
 train_data = data.iloc[:split_idx].copy()
 test_data = data.iloc[split_idx:].copy()

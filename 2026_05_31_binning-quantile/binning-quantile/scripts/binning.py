@@ -274,41 +274,66 @@ def fit_bin_frequency(x, y, n=10, special_values=[-999, -9999, -1111]):
     """等频分箱 FIT 模式：从 train 学习边界，返回 (result_df, bin_edges)
     bin_edges 可直接传给 apply_bin_frequency 用于 test 分箱"""
     epsilon = 1e-6
+    out_cols = ['min_bin', 'max_bin', 'bin_label', 'bad', 'acu_badnum', 'total', 'acu_allnum',
+                'bad_rate', 'cum_bad_rate', 'acu_badrate', 'badattr', 'acu_bin_badrate',
+                'goodattr', 'acu_bin_goodrate', 'bins_iv', 'total_iv', 'bin_ks', 'total_ks', 'woe', 'lift']
     
     # ① 把特殊值单独拆出来
     special_mask = x.isin(special_values)
     x_special, y_special = x[special_mask], y[special_mask]
     x_normal,  y_normal  = x[~special_mask], y[~special_mask]
+    x_normal = x_normal.dropna()
+    y_normal = y_normal.loc[x_normal.index]
     
     total = y.count()
     bad   = y.sum()
     good  = total - bad
 
-    # ② 正常值做等频分箱（学习边界）
-    qcut_result = pd.qcut(x_normal, n, duplicates='drop')
-    bin_intervals = qcut_result.cat.categories  # IntervalIndex
+    # ② 正常值做等频分箱（学习边界）；全为特殊值/常数列时跳过 qcut
+    d3 = pd.DataFrame()
+    bin_edges = None
+    if len(x_normal) > 0 and x_normal.nunique() > 1:
+        try:
+            qcut_result = pd.qcut(x_normal, n, duplicates='drop')
+            bin_intervals = qcut_result.cat.categories
 
-    # 从 IntervalIndex 提取统一的边界（用于 test 的 pd.cut）
-    breaks = sorted(set(
-        [interval.left for interval in bin_intervals] +
-        [interval.right for interval in bin_intervals]
-    ))
-    # breaks = [min, ..., max]；第一项用 -inf，最后一项用 +inf 覆盖全范围
-    bin_edges = [-np.inf] + breaks[1:] + [np.inf]
+            breaks = sorted(set(
+                [interval.left for interval in bin_intervals] +
+                [interval.right for interval in bin_intervals]
+            ))
+            bin_edges = [-np.inf] + breaks[1:] + [np.inf]
 
-    d1 = pd.DataFrame({
-        'x': x_normal, 
-        'y': y_normal, 
-        'bucket': qcut_result
-    })
-    d2 = d1.groupby('bucket', as_index=True, observed=True)
-    d3 = pd.DataFrame(d2.x.min(), columns=['min_bin'])
-    d3['min_bin']  = d2.x.min()
-    d3['max_bin']  = d2.x.max()
-    d3['bad']      = d2.y.sum()
-    d3['total']    = d2.y.count()
-    d3['bin_label'] = d3.index.astype(str)
-    d3 = d3.reset_index(drop=True)
+            d1 = pd.DataFrame({
+                'x': x_normal,
+                'y': y_normal,
+                'bucket': qcut_result
+            })
+            d2 = d1.groupby('bucket', as_index=True, observed=True)
+            d3 = pd.DataFrame(d2.x.min(), columns=['min_bin'])
+            d3['min_bin']  = d2.x.min()
+            d3['max_bin']  = d2.x.max()
+            d3['bad']      = d2.y.sum()
+            d3['total']    = d2.y.count()
+            d3['bin_label'] = d3.index.astype(str)
+            d3 = d3.reset_index(drop=True)
+        except Exception:
+            bin_edges = [-np.inf, np.inf]
+            d3 = pd.DataFrame([{
+                'min_bin': x_normal.min(),
+                'max_bin': x_normal.max(),
+                'bad': y_normal.sum(),
+                'total': y_normal.count(),
+                'bin_label': f'({x_normal.min()}, {x_normal.max()}]',
+            }])
+    elif len(x_normal) > 0:
+        bin_edges = [-np.inf, np.inf]
+        d3 = pd.DataFrame([{
+            'min_bin': x_normal.min(),
+            'max_bin': x_normal.max(),
+            'bad': y_normal.sum(),
+            'total': y_normal.count(),
+            'bin_label': f'({x_normal.min()}, {x_normal.max()}]',
+        }])
 
     # ③ 构造特殊值箱
     special_rows = []
@@ -329,20 +354,28 @@ def fit_bin_frequency(x, y, n=10, special_values=[-999, -9999, -1111]):
         d_special = pd.DataFrame(special_rows)
         d3 = pd.concat([d3, d_special], ignore_index=True)
 
+    if len(d3) == 0:
+        return pd.DataFrame(columns=out_cols), bin_edges
+
     # ④ 计算衍生指标
     d3['bad_rate']  = d3['bad']  / d3['total']
-    d3['badattr']   = d3['bad']  / bad
-    d3['goodattr']  = (d3['total'] - d3['bad']) / good
+    d3['badattr']   = d3['bad']  / bad if bad > 0 else 0
+    d3['goodattr']  = (d3['total'] - d3['bad']) / good if good > 0 else 0
     d3['woe']       = np.log((d3['badattr'] + epsilon) / (d3['goodattr'] + epsilon))
-    d3['cum_bad_rate'] = bad / total
-    d3['lift']      = d3['bad_rate'] / d3['cum_bad_rate']
+    d3['cum_bad_rate'] = bad / total if total > 0 else 0
+    d3['lift']      = np.where(d3['cum_bad_rate'] > 0, d3['bad_rate'] / d3['cum_bad_rate'], 0)
     d3['bins_iv']   = (d3['badattr'] - d3['goodattr']) * d3['woe']
     d3['total_iv']  = d3['bins_iv'].sum()
 
     # ⑤ 正常箱按 min_bin 排序，特殊值箱放最后
-    d_normal_final  = d3[~d3['bin_label'].str.startswith('special')].sort_values('min_bin').reset_index(drop=True)
-    d_special_final = d3[ d3['bin_label'].str.startswith('special')].reset_index(drop=True)
-    d4 = pd.concat([d_normal_final, d_special_final], ignore_index=True)
+    has_normal = (~d3['bin_label'].str.startswith('special')).any()
+    has_special = d3['bin_label'].str.startswith('special').any()
+    parts = []
+    if has_normal:
+        parts.append(d3[~d3['bin_label'].str.startswith('special')].sort_values('min_bin').reset_index(drop=True))
+    if has_special:
+        parts.append(d3[d3['bin_label'].str.startswith('special')].reset_index(drop=True))
+    d4 = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
     # ⑥ KS
     d4['acu_bin_badrate']  = d4['badattr'].cumsum()

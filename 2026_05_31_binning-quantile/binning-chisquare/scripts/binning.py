@@ -355,6 +355,11 @@ def apply_bin_frequency(x, y, bin_edges=None, special_values=[-999, -9999, -1111
     if special_rows:
         d_special = pd.DataFrame(special_rows)
         d3 = pd.concat([d3, d_special], ignore_index=True)
+    cols = ['min_bin', 'max_bin', 'bin_label', 'bad', 'acu_badnum', 'total', 'acu_allnum',
+           'bad_rate', 'cum_bad_rate', 'acu_badrate', 'badattr', 'acu_bin_badrate',
+           'goodattr', 'acu_bin_goodrate', 'bins_iv', 'total_iv', 'bin_ks', 'total_ks', 'woe', 'lift']
+    if len(d3) == 0:
+        return pd.DataFrame(columns=cols)
     # Derived metrics
     d3['bad_rate'] = d3['bad'] / d3['total']
     d3['badattr'] = d3['bad'] / bad if bad > 0 else 0
@@ -384,9 +389,8 @@ def apply_bin_frequency(x, y, bin_edges=None, special_values=[-999, -9999, -1111
     else:
         for col in ['acu_bin_badrate', 'acu_bin_goodrate', 'bin_ks', 'total_ks', 'acu_badnum', 'acu_allnum', 'acu_badrate']:
             d4[col] = np.nan
-    cols = ['min_bin', 'max_bin', 'bin_label', 'bad', 'acu_badnum', 'total', 'acu_allnum',
-           'bad_rate', 'cum_bad_rate', 'acu_badrate', 'badattr', 'acu_bin_badrate',
-           'goodattr', 'acu_bin_goodrate', 'bins_iv', 'total_iv', 'bin_ks', 'total_ks', 'woe', 'lift']
+    if len(d4) == 0:
+        return pd.DataFrame(columns=cols)
     return d4[cols]
 
 

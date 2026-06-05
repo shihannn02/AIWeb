@@ -171,8 +171,6 @@ def validate_file_get(
     test_file_id: Optional[str] = None,
     _: str = Depends(get_current_user),
 ):
-    if split_mode == "ai" and oot_ratio <= 0:
-        oot_ratio = 0.2
     return _run_validate(
         file_id, label, split_mode, time_col, oot_ratio,
         cutoff_date, train_file_id, test_file_id,

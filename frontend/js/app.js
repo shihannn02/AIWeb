@@ -389,17 +389,20 @@ function renderValidationInfo(data) {
   `;
 }
 
+function readOotRatio() {
+  const splitMode = $("#split-mode")?.value || "ai";
+  if (splitMode !== "ai") return 0;
+  const v = parseFloat($("#oot-ratio")?.value);
+  return Number.isFinite(v) ? v : 0.2;
+}
+
 function buildValidatePayload() {
   const splitMode = $("#split-mode")?.value || "ai";
-  let ootRatio = parseFloat($("#oot-ratio")?.value);
-  if (splitMode === "ai" && (!Number.isFinite(ootRatio) || ootRatio <= 0)) {
-    ootRatio = 0.2;
-  }
   return {
     label: $("#label-col").value,
     split_mode: splitMode,
     time_col: $("#time-col").value,
-    oot_ratio: ootRatio,
+    oot_ratio: readOotRatio(),
     cutoff_date: $("#cutoff-date")?.value || null,
     train_file_id: trainFileId || null,
     test_file_id: testFileId || null,
@@ -411,7 +414,7 @@ function payloadToQuery(payload) {
   params.set("label", payload.label);
   params.set("split_mode", payload.split_mode);
   if (payload.time_col) params.set("time_col", payload.time_col);
-  params.set("oot_ratio", String(payload.oot_ratio ?? 0.2));
+  params.set("oot_ratio", String(payload.oot_ratio));
   if (payload.cutoff_date) params.set("cutoff_date", payload.cutoff_date);
   if (payload.train_file_id) params.set("train_file_id", payload.train_file_id);
   if (payload.test_file_id) params.set("test_file_id", payload.test_file_id);
@@ -423,11 +426,20 @@ async function refreshValidation() {
 
   const payload = buildValidatePayload();
   const label = payload.label;
-  const query = payloadToQuery(payload);
 
   try {
-    const data = await api(`/api/files/${fileId}/validate?${query}`, {
-      headers: headers(false),
+    const data = await api(`/api/files/${fileId}/validate`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        label: payload.label,
+        split_mode: payload.split_mode,
+        time_col: payload.time_col || null,
+        oot_ratio: payload.oot_ratio,
+        cutoff_date: payload.cutoff_date,
+        train_file_id: payload.train_file_id,
+        test_file_id: payload.test_file_id,
+      }),
     });
 
     // 标签列无 0/1 时自动切到推荐列（仅一次，避免死循环）
@@ -546,12 +558,22 @@ function renderRunSummary() {
   const method = document.querySelector('input[name="method"]:checked').value;
   const methodNames = { quantile: "等频", chisquare: "卡方", headtail5: "头尾5%" };
   const splitNames = { ai: "AI 自动划分", cutoff: "条件划分", manual: "自行划分" };
+  const splitMode = $("#split-mode").value;
+  let splitDetail = "";
+  if (splitMode === "ai") {
+    const oot = $("#oot-ratio").value;
+    splitDetail = `<div><dt>OOT 比例</dt><dd>${oot}</dd></div>`;
+  } else if (splitMode === "cutoff") {
+    splitDetail = `<div><dt>截止日</dt><dd>${$("#cutoff-date").value || "未填写"}</dd></div>
+      <div><dt>说明</dt><dd>条件划分按截止日切分，与 OOT 比例无关</dd></div>`;
+  }
   $("#run-summary").innerHTML = `
     <strong>即将执行</strong>
     <dl class="info-grid">
       <div><dt>分箱方法</dt><dd>${methodNames[method]}</dd></div>
       <div><dt>标签列</dt><dd>${$("#label-col").value}</dd></div>
-      <div><dt>切分方式</dt><dd>${splitNames[$("#split-mode").value]}</dd></div>
+      <div><dt>切分方式</dt><dd>${splitNames[splitMode]}</dd></div>
+      ${splitDetail}
       <div><dt>箱数</dt><dd>${method === "headtail5" ? "自动(头尾5%)" : $("#bin-num").value}</dd></div>
     </dl>
   `;
@@ -639,7 +661,7 @@ $("#run-binning").addEventListener("click", async () => {
     time_col: $("#time-col").value,
     bin_num: parseInt($("#bin-num").value, 10),
     init_bin_num: 20,
-    oot_ratio: parseFloat($("#oot-ratio").value),
+    oot_ratio: readOotRatio(),
     split_mode: $("#split-mode").value,
     cutoff_date: $("#cutoff-date").value || null,
     train_file_id: trainFileId || null,

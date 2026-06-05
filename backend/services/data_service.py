@@ -108,12 +108,14 @@ def guess_best_time_col(columns: List[str]) -> Optional[str]:
         lower = col.lower()
         if lower.endswith("_id") or lower == "id":
             return -100
-        if "apply_time" in lower or "create_time" in lower:
+        if lower.endswith("_date") or "apply_date" in lower or "datetime" in lower:
+            return 110
+        if "date" in lower:
             return 100
+        if "apply_time" in lower or "create_time" in lower:
+            return 85
         if lower.endswith("_time") or lower.endswith("_time_x") or lower.endswith("_time_y"):
-            return 90
-        if "date" in lower or "datetime" in lower:
-            return 80
+            return 75
         if "month" in lower:
             return 50
         if "apply" in lower:
@@ -155,6 +157,43 @@ def detect_time_candidates(columns: List[str]) -> List[str]:
     return [c for c in columns if any(k in c.lower() for k in keywords)]
 
 
+def _coerce_time_series(series: pd.Series) -> pd.Series:
+    """将时间列解析为可比较的 datetime（兼容 2026/3/7、2026-05-01、Unix 秒/毫秒时间戳等）。"""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    as_num = pd.to_numeric(series, errors="coerce")
+    numeric_ratio = float(as_num.notna().mean()) if len(series) else 0.0
+    if numeric_ratio >= 0.5:
+        median = float(as_num.median()) if as_num.notna().any() else 0.0
+        abs_med = abs(median)
+        if 1e12 <= abs_med <= 2e13:
+            parsed = pd.to_datetime(as_num, unit="ms", errors="coerce")
+            if parsed.notna().any():
+                return parsed
+        if 1e9 <= abs_med <= 2e10:
+            parsed = pd.to_datetime(as_num, unit="s", errors="coerce")
+            if parsed.notna().any():
+                return parsed
+
+    parsed = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    if parsed.notna().any() and numeric_ratio >= 0.5:
+        if parsed.max().year < 1980 and as_num.median() > 1e9:
+            return pd.to_datetime(as_num, unit="s", errors="coerce")
+    if parsed.notna().any():
+        return parsed
+    if as_num.notna().any():
+        return pd.to_datetime(as_num, unit="s", errors="coerce")
+    return parsed
+
+
+def _parse_cutoff_timestamp(cutoff_date: str) -> pd.Timestamp:
+    ts = pd.to_datetime(cutoff_date, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"无法解析日期截止点: {cutoff_date}")
+    return ts
+
+
 def _stats_for_frame(df: pd.DataFrame, label: str) -> Dict[str, Any]:
     normalized = _normalize_binary_label(df[label])
     valid_mask = normalized.isin([0, 1])
@@ -187,8 +226,12 @@ def split_dataframe(
             return None, None
         if time_col not in valid_df.columns:
             raise ValueError(f"时间列 '{time_col}' 不存在，无法切分 Train/Test")
-        train = valid_df[valid_df[time_col].astype(str) < cutoff_date].copy()
-        test = valid_df[valid_df[time_col].astype(str) >= cutoff_date].copy()
+        times = _coerce_time_series(valid_df[time_col])
+        cutoff = _parse_cutoff_timestamp(cutoff_date)
+        if times.isna().all():
+            raise ValueError(f"时间列 '{time_col}' 无法解析为日期，请检查格式")
+        train = valid_df[times < cutoff].copy()
+        test = valid_df[times >= cutoff].copy()
         return train, test
 
     if split_mode == "ai":
@@ -197,7 +240,10 @@ def split_dataframe(
             return valid_df.copy(), valid_df.iloc[0:0].copy()
         if time_col not in valid_df.columns:
             raise ValueError(f"时间列 '{time_col}' 不存在，无法切分 Train/Test")
-        sorted_df = valid_df.sort_values(time_col).reset_index(drop=True)
+        sort_key = _coerce_time_series(valid_df[time_col])
+        sorted_df = valid_df.assign(__sort_time=sort_key).sort_values("__sort_time").drop(
+            columns="__sort_time"
+        ).reset_index(drop=True)
         split_idx = int(len(sorted_df) * (1 - oot_ratio))
         train = sorted_df.iloc[:split_idx].copy()
         test = sorted_df.iloc[split_idx:].copy()
@@ -269,21 +315,32 @@ def validate_dataset(
                 }
                 if len(test) > 0:
                     split_info["test"] = _stats_for_frame(test, label)
-                elif split_mode == "ai" and oot_ratio <= 0:
+                else:
                     split_info["test"] = {
-                        "rows": 0, "columns": len(df.columns),
-                        "valid_samples": 0, "bad_rate": 0.0,
+                        "rows": 0,
+                        "columns": len(df.columns),
+                        "valid_samples": 0,
+                        "bad_rate": 0.0,
                     }
-                if len(test) > 0 or (split_mode == "ai" and oot_ratio <= 0 and len(train) > 0):
+                if len(train) > 0 or len(test) > 0:
                     result["split"] = split_info
+                    if split_mode == "cutoff" and len(train) > 0 and len(test) == 0 and time_col:
+                        normalized = _normalize_binary_label(df[label])
+                        valid_df = df[normalized.isin([0, 1])].copy()
+                        if time_col in valid_df.columns:
+                            times = _coerce_time_series(valid_df[time_col])
+                            if times.notna().any():
+                                max_dt = times.max().strftime("%Y-%m-%d")
+                                result["split_hint"] = (
+                                    f"截止点 {cutoff_date} 之后无有效 0/1 样本"
+                                    f"（有效样本最晚日期约 {max_dt}），请调早截止日"
+                                )
     except ValueError as exc:
         result["split_error"] = str(exc)
 
     if result["split"] is None and split_mode in ("ai", "cutoff", "manual"):
         if valid_count == 0:
             result["split_hint"] = f"标签列「{label}」无有效 0/1 样本，请改选如「{suggested_label}」"
-        elif split_mode == "ai" and (oot_ratio <= 0 or oot_ratio >= 1):
-            result["split_hint"] = "OOT 比例为 0，未切分 Test（仅展示 Train 全量）"
         elif split_mode == "cutoff" and not cutoff_date:
             result["split_hint"] = "请填写日期截止点以切分 Train/Test"
         elif split_mode == "manual":

@@ -375,18 +375,99 @@ def calculate_ks(good, bad):
     ks = np.abs(cum_good - cum_bad)
     return ks
 
+
+def fit_cate_bounds(train_df, cat_cols):
+    """高基数类别：仅保留样本量>10的档位，其余合并为 Other（与等频/卡方一致）。"""
+    info = {}
+    for col in cat_cols:
+        if col not in train_df.columns:
+            continue
+        if train_df[col].nunique() > 50:
+            vc = train_df[col].value_counts()
+            info[col] = vc[vc > 10].index.tolist()
+    return info
+
+
+def transform_cate_series(series, valid_cats=None):
+    s = series.astype(str).str.strip()
+    s = s.replace(['-999', '-9999', '-999999', 'nan', 'None', '', 'NaT', 'nan'], np.nan)
+    s = s.fillna('MISSING')
+    if valid_cats is not None:
+        s = s.where(s.isin(valid_cats), 'Other')
+    return s
+
+
+def get_cate_bin_detail(data, flag_name, factor_name):
+    """类别变量：每个类别一箱，输出与头尾5%数值分箱相同列结构。"""
+    k = group_by_var_value(data, flag_name, factor_name, '#Bad', '#Good', discrete_list=[factor_name])
+    if len(k) == 0:
+        return pd.DataFrame(), None
+    good = k['#Good'].values.astype(float)
+    bad = k['#Bad'].values.astype(float)
+    total_good = good.sum()
+    total_bad = bad.sum()
+    total = total_good + total_bad
+    good_pct = good / total_good if total_good > 0 else np.zeros_like(good, dtype=float)
+    bad_pct = bad / total_bad if total_bad > 0 else np.zeros_like(bad, dtype=float)
+    woe = np.log(np.where((good_pct > 0) & (bad_pct > 0), good_pct / bad_pct, 1.0))
+    woe = np.where(np.isfinite(woe), woe, 0.0)
+    iv = (good_pct - bad_pct) * woe
+    result = pd.DataFrame({
+        'Bin': k[factor_name].astype(str).values,
+        '#Obs': k['#Obs'].values,
+        '#Good': good,
+        '#Bad': bad,
+        '%Obs': k['#Obs'].values / total if total > 0 else 0,
+        '%Bad_Rate': k['%Bad_Rate'].values,
+        'WOE': woe,
+        'IV(bin)': iv,
+    })
+    result['#Cum_Obs'] = np.cumsum(result['#Obs'])
+    result['%Cum_Obs'] = np.cumsum(result['%Obs'])
+    result['%Good'] = result['#Good'] / total_good if total_good > 0 else 0
+    result['#Cum_Good'] = np.cumsum(result['#Good'])
+    result['%Cum_Good'] = result['#Cum_Good'] / total_good if total_good > 0 else 0
+    result['%Bad'] = result['#Bad'] / total_bad if total_bad > 0 else 0
+    result['#Cum_Bad'] = np.cumsum(result['#Bad'])
+    result['%Cum_Bad'] = result['#Cum_Bad'] / total_bad if total_bad > 0 else 0
+    result['IV(total)'] = np.cumsum(result['IV(bin)'])
+    portfolio_br = total_bad / total if total > 0 else 0
+    result['Lift'] = result['%Bad_Rate'] / portfolio_br if portfolio_br > 0 else 0
+    result['Odds1'] = np.nan
+    result['Odds2'] = np.nan
+    return result, k
+
+
+def _split_numeric_and_cate_columns(df):
+    """object/category 能转数值的保留为数值，否则作为类别变量参与分箱。"""
+    cate_cols = []
+    for col in df.select_dtypes(include=['object', 'category']).columns:
+        s = df[col].astype(str).str.strip()
+        s = s.replace(['-999', '-9999', '-999999', 'nan', 'None', '', 'NaT'], np.nan)
+        try:
+            df[col] = pd.to_numeric(s, errors='raise')
+        except (ValueError, TypeError):
+            cate_cols.append(col)
+    return df, cate_cols
+
+
+def _apply_cate_preprocess(df, cate_cols, cate_bounds):
+    for col in cate_cols:
+        if col in df.columns:
+            df[col] = transform_cate_series(df[col], cate_bounds.get(col))
+    return df
+
+
 # ==================== RUN BINNING ON TRAIN ====================
 print("="*50)
 print("正在对 Train 数据做头尾5%分箱 (FIT)...")
 
-# Clean object columns (train)
-for i in train_raw.columns[train_raw.dtypes == 'object']:
-    train_raw[i] = train_raw[i].astype(str).str.strip()
-    train_raw.loc[train_raw[i].isin(['-999', '-9999', '-999999']), i] = np.nan
-    try:
-        train_raw[i] = train_raw[i].astype('float64')
-    except:
-        train_raw.drop(columns=[i], inplace=True)
+# Clean object/category columns (train): 可转数值的转数值，否则保留为类别变量
+train_raw, cate_cols = _split_numeric_and_cate_columns(train_raw)
+cate_bounds = fit_cate_bounds(train_raw, cate_cols)
+train_raw = _apply_cate_preprocess(train_raw, cate_cols, cate_bounds)
+if cate_cols:
+    print(f'类别变量 {len(cate_cols)} 个，将按类别分箱')
 
 train_raw['agr_label'] = 1
 my_data = train_raw
@@ -450,14 +531,20 @@ for sample_type_sub in sample_type:
         for var in mydata1.columns[:-1]:
             print('正在分析变量:', var)
             try:
-                sample_bin, k, knot = get_bin_lift_with_edges(
-                    data=mydata1, flag_name=target_sub, factor_name=var,
-                    min_rate=min_rate, sub_div_bin=sub_div_bin, min_num=min_num,
-                    method='best', numOfSplit=25
-                )
-                if len(sample_bin) == 0:
-                    continue
-                train_stored_edges[var] = {'k': k, 'knots': knot}
+                if var in cate_cols:
+                    sample_bin, k = get_cate_bin_detail(mydata1, target_sub, var)
+                    if len(sample_bin) == 0:
+                        continue
+                    train_stored_edges[var] = {'type': 'cate', 'k': k}
+                else:
+                    sample_bin, k, knot = get_bin_lift_with_edges(
+                        data=mydata1, flag_name=target_sub, factor_name=var,
+                        min_rate=min_rate, sub_div_bin=sub_div_bin, min_num=min_num,
+                        method='best', numOfSplit=25
+                    )
+                    if len(sample_bin) == 0:
+                        continue
+                    train_stored_edges[var] = {'k': k, 'knots': knot}
                 good = sample_bin['#Good'].values
                 bad = sample_bin['#Bad'].values
                 ks_values = calculate_ks(good, bad)
@@ -509,6 +596,8 @@ if len(train_bins_detail) > 0 and money_train is not None:
                 mask = (bindata_with_money[var] > lower) & (bindata_with_money[var] <= upper)
             elif bin_label.startswith('[') and bin_label.endswith(']') and ',' not in bin_label:
                 mask = bindata_with_money[var] == float(bin_label.strip('[]'))
+            elif var in cate_cols:
+                mask = bindata_with_money[var].astype(str) == str(bin_label)
             else:
                 money_rate_list.append(np.nan); continue
             sub = bindata_with_money[mask]
@@ -525,13 +614,11 @@ if actual_oot:
     print("="*50)
     print("正在对 Test 数据做头尾5%分箱 (APPLY)...")
 
-    for i in test_raw.columns[test_raw.dtypes == 'object']:
-        test_raw[i] = test_raw[i].astype(str).str.strip()
-        test_raw.loc[test_raw[i].isin(['-999', '-9999', '-999999']), i] = np.nan
-        try:
-            test_raw[i] = test_raw[i].astype('float64')
-        except:
-            test_raw.drop(columns=[i], inplace=True)
+    test_raw, _test_cate = _split_numeric_and_cate_columns(test_raw)
+    for col in cate_cols:
+        if col not in test_raw.columns:
+            continue
+        test_raw[col] = transform_cate_series(test_raw[col], cate_bounds.get(col))
 
     test_raw['agr_label'] = 1
     test_bins_detail_rows = []
@@ -551,23 +638,26 @@ if actual_oot:
                 print('  正在 APPLY 变量:', var)
                 try:
                     train_info = train_stored_edges[var]
-                    k_test = group_by_var_value(mydata1_test, target_sub, var, '#Bad', '#Good')
-                    k1_test = get_na_bin(mydata1_test, target_sub, var, '#Bad', '#Good')
-                    if len(k_test) == 0:
-                        continue
-                    knot = train_info['knots']
-                    # Clamp knot indices to safe range for test data
-                    max_idx = len(k_test) - 1
-                    clamped_knot = [k for k in knot if k < max_idx]
-                    if len(clamped_knot) == 0 and max_idx >= 0:
-                        # Fallback: no valid knots, use 2 bins
-                        clamped_knot = [max_idx // 2]
-                    sample_bin_test = important_bin_calculate(
-                        k_test, k1_test, '#Good', '#Bad', var,
-                        [0] + clamped_knot + [max_idx]
-                    )
-                    if len(sample_bin_test) == 0:
-                        continue
+                    if train_info.get('type') == 'cate':
+                        sample_bin_test, _ = get_cate_bin_detail(mydata1_test, target_sub, var)
+                        if len(sample_bin_test) == 0:
+                            continue
+                    else:
+                        k_test = group_by_var_value(mydata1_test, target_sub, var, '#Bad', '#Good')
+                        k1_test = get_na_bin(mydata1_test, target_sub, var, '#Bad', '#Good')
+                        if len(k_test) == 0:
+                            continue
+                        knot = train_info['knots']
+                        max_idx = len(k_test) - 1
+                        clamped_knot = [k for k in knot if k < max_idx]
+                        if len(clamped_knot) == 0 and max_idx >= 0:
+                            clamped_knot = [max_idx // 2]
+                        sample_bin_test = important_bin_calculate(
+                            k_test, k1_test, '#Good', '#Bad', var,
+                            [0] + clamped_knot + [max_idx]
+                        )
+                        if len(sample_bin_test) == 0:
+                            continue
                     good = sample_bin_test['#Good'].values
                     bad = sample_bin_test['#Bad'].values
                     ks_values = calculate_ks(good, bad)
@@ -620,6 +710,8 @@ if actual_oot:
                     mask = (bindata_with_money_test[var] > lower) & (bindata_with_money_test[var] <= upper)
                 elif bin_label.startswith('[') and bin_label.endswith(']') and ',' not in bin_label:
                     mask = bindata_with_money_test[var] == float(bin_label.strip('[]'))
+                elif var in cate_cols:
+                    mask = bindata_with_money_test[var].astype(str) == str(bin_label)
                 else:
                     money_rate_list_test.append(np.nan); continue
                 sub = bindata_with_money_test[mask]
