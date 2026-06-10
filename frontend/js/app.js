@@ -994,8 +994,6 @@ function getFeatureHitCount(f) {
 }
 
 function getFeatureBadRate(f) {
-  const live = getFeatureLiveStats(f);
-  if (live) return live.bad_rate;
   return f.max_bad_rate;
 }
 
@@ -1013,22 +1011,35 @@ function sortedClusters(clusters) {
 }
 
 function getPreviewRules(forceFeature) {
-  const feats = selectedFeatures.size > 0
-    ? [...selectedFeatures]
-    : [(forceFeature || activeFeature)].filter(Boolean);
-  return feats.map((f) => {
-    const r = getFeatureRule(f);
-    const rule = {
-      feature: f,
-      operator: r.operator,
-      threshold: Number(r.threshold) || 0,
-    };
-    if (r.operator === "in") {
-      rule.values = [...(r.values || [])];
-      if (!rule.values.length) return null;
-    }
-    return rule;
-  }).filter(Boolean);
+  if (selectedFeatures.size > 0) {
+    return [...selectedFeatures].map((f) => {
+      const r = getFeatureRule(f);
+      const rule = {
+        feature: f,
+        operator: r.operator,
+        threshold: Number(r.threshold) || 0,
+      };
+      if (r.operator === "in") {
+        rule.values = [...(r.values || [])];
+        if (!rule.values.length) return null;
+      }
+      return rule;
+    }).filter(Boolean);
+  }
+  if (forceFeature === null) return [];
+  const browse = forceFeature || activeFeature;
+  if (!browse) return [];
+  const r = getFeatureRule(browse);
+  const rule = {
+    feature: browse,
+    operator: r.operator,
+    threshold: Number(r.threshold) || 0,
+  };
+  if (r.operator === "in") {
+    rule.values = [...(r.values || [])];
+    if (!rule.values.length) return [];
+  }
+  return [rule];
 }
 
 function renderImpactCard(data, rules) {
@@ -1121,6 +1132,11 @@ async function refreshRejectPreview(forceFeature) {
         money_bad_rate: pr.money_bad_rate,
       });
     }
+    for (const key of [...liveFeatureStats.keys()]) {
+      if (!selectedFeatures.has(key)) {
+        liveFeatureStats.delete(key);
+      }
+    }
     updateFeatureLiveDisplays();
     card.innerHTML = rules.length
       ? renderImpactCard(data, rules)
@@ -1150,7 +1166,15 @@ function updateFeatureLiveDisplays() {
       hitEl.textContent = `${live ? live.hit_count : meta.hit_count} 人`;
     }
     if (rateEl) {
-      rateEl.textContent = pct(live ? live.bad_rate : meta.max_bad_rate);
+      const isCat = isCategoricalFeature(meta);
+      rateEl.textContent = pct(meta.max_bad_rate);
+      rateEl.title = live
+        ? isCat
+          ? `候选最高类别坏率 ${pct(meta.max_bad_rate)}；当前规则命中坏率 ${pct(live.bad_rate)}`
+          : `建议拒绝箱合并坏率 ${pct(meta.max_bad_rate)}；当前规则命中坏率 ${pct(live.bad_rate)}`
+        : isCat
+          ? `超阈值类别中最高坏率 ${pct(meta.max_bad_rate)}`
+          : `建议拒绝箱合并坏率 ${pct(meta.max_bad_rate)}`;
     }
   });
 }
@@ -1333,9 +1357,11 @@ function renderFeatureClusters(clusters) {
       } else {
         selectedFeatures.delete(feat);
         featureRules.delete(feat);
+        liveFeatureStats.delete(feat);
       }
       updateSelectedCount();
-      scheduleRejectPreview(feat);
+      updateFeatureLiveDisplays();
+      scheduleRejectPreview(selectedFeatures.size ? undefined : null);
     });
     row.addEventListener("click", (e) => {
       if (e.target.type === "checkbox") return;
@@ -1440,7 +1466,15 @@ async function openFeatureDetail(feature, skipSplitAnim = false) {
           ? "已手动调整拒绝类别，切换其他变量后再回来仍会保留"
           : "已勾选该变量：下方超阈值类别默认全选，可取消不需要的")
         : "勾选左侧变量后，下方超阈值类别将默认全选")
-      : `建议箱 ${data.rule?.rule_source_bin || ""}`;
+      : (() => {
+          const bins = data.rule?.rule_source_bins;
+          if (bins?.length > 1) {
+            const side = meta?.rule_type === "head" ? "头" : "尾";
+            const br = data.rule?.rule_source_bad_rate ?? meta?.max_bad_rate ?? 0;
+            return `建议拒绝连续${side}箱 ${bins.join("、")}（合并坏率 ${pct(br)}）`;
+          }
+          return `建议箱 ${data.rule?.rule_source_bin || ""}`;
+        })();
     $("#detail-subtitle").textContent = `${data.chinese_name} · ${meta?.reason || ""} · ${subHint}`;
     renderBinTables(data, threshold);
     if (data.value_type === "categorical" && selectedFeatures.has(feature)) {
@@ -1555,8 +1589,14 @@ function renderBinTables(detail, badRateThreshold) {
   const sameBins = binCount > 0 && testRows.length === binCount
     && trainRows.every((r, i) => r.bin === testRows[i]?.bin);
 
+  const testObsSum = detail.test_obs_sum ?? testRows.reduce((s, r) => s + (Number(r.obs) || 0), 0);
+  const testRowCount = detail.test_row_count ?? null;
+  const countHint = testRowCount != null
+    ? `Test 样本 ${testRowCount} 人，分箱合计 ${testObsSum} 人${testRowCount === testObsSum ? "" : "（不一致请重新分箱或联系管理员）"}。`
+    : `Test 分箱合计 ${testObsSum} 人。`;
+
   el.innerHTML = `
-    <p class="sub bin-hint">共 ${binCount} 个分箱（含缺失值箱）。Test 与 Train 使用<strong>相同分箱边界</strong>（按 Train 切点重算 Test 统计）。橙色高亮为坏率 &gt; ${pct(badRateThreshold)} 的箱，蓝色为建议拒绝箱；坏率列带条形图。</p>
+    <p class="sub bin-hint">共 ${binCount} 个分箱（含缺失值箱）。${countHint}Test 与 Train 使用<strong>相同分箱边界</strong>；缺失/特殊值箱排在最前。</p>
     ${!sameBins && testRows.length ? '<p class="warn">Test 分箱与 Train 未完全对齐，请刷新或重新分箱。</p>' : ""}
     <div class="stack-table-wrap">
       <div>
@@ -1564,7 +1604,7 @@ function renderBinTables(detail, badRateThreshold) {
         ${renderBinTable(trainRows, badRateThreshold)}
       </div>
       <div>
-        <h4>Test 分箱明细（${testRows.length} 箱，与 Train 同序）</h4>
+        <h4>Test 分箱明细（${trainRows.length} 箱，与 Train 同序）</h4>
         ${renderBinTable(testRows, badRateThreshold, trainRows)}
       </div>
     </div>
@@ -1649,13 +1689,16 @@ function escapeAttr(s) {
 }
 
 function renderBinTable(rows, badRateThreshold, binTemplate) {
-  if (!rows?.length) return `<p class="sub">无数据</p>`;
   const ordered = binTemplate?.length
-    ? binTemplate.map((t) => rows.find((r) => r.bin === t.bin) || {
+    ? binTemplate.map((t) => rows?.find((r) => r.bin === t.bin) || {
         bin: t.bin, obs: 0, bad: 0, bad_rate: 0, lift: null,
         is_rule_bin: t.is_rule_bin, is_high_bad: false,
       })
-    : rows;
+    : (rows || []);
+  if (!ordered.length) return `<p class="sub">无数据</p>`;
+  const totalObs = ordered.reduce((s, r) => s + (Number(r.obs) || 0), 0);
+  const totalBad = ordered.reduce((s, r) => s + (Number(r.bad) || 0), 0);
+  const totalBr = totalObs ? totalBad / totalObs : 0;
   return `
     <table class="data-table bin-detail-table">
       <thead>
@@ -1683,6 +1726,13 @@ function renderBinTable(rows, badRateThreshold, binTemplate) {
           </tr>
         `;
         }).join("")}
+        <tr class="bin-total-row">
+          <td><strong>合计</strong></td>
+          <td><strong>${totalObs}</strong></td>
+          <td><strong>${totalBad}</strong></td>
+          <td class="bar-col">${renderRateBar(totalBr, "bad")}</td>
+          <td>—</td>
+        </tr>
       </tbody>
     </table>
   `;

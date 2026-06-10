@@ -14,6 +14,7 @@ import threading
 from services.binning_runner import create_binning_job, execute_binning_job, get_job
 from services.feature_review_service import (
     build_feature_review,
+    ensure_test_binning_aligned_for_job,
     evaluate_reject_preview,
     get_feature_detail,
 )
@@ -42,7 +43,7 @@ app.add_middleware(
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-APP_BUILD = "20260605k"
+APP_BUILD = "20260609e"
 
 
 @app.middleware("http")
@@ -417,6 +418,7 @@ def download_result(job_id: str, _: str = Depends(get_current_user)):
     job = get_job(job_id)
     if not job or not job.output_path or not job.output_path.exists():
         raise HTTPException(status_code=404, detail="结果文件不存在")
+    ensure_test_binning_aligned_for_job(job_id)
     return FileResponse(
         job.output_path,
         filename=job.output_path.name,

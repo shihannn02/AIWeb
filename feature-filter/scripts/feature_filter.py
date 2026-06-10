@@ -23,7 +23,10 @@ SUB_COLS = ['总人数', '逾期数', '坏率', '金额逾期率']
 def parse_bin_boundary(bin_label):
     """Always return 5-element tuple: (lo, hi, left_closed, right_closed, is_missing)"""
     s = str(bin_label).strip()
-    if any(k in s for k in ['特殊','空值','缺失','nan','NA','null']):
+    lower = s.lower()
+    if lower.startswith('special(') or lower == 'missing':
+        return (None, None, False, False, True)
+    if any(k in s for k in ['特殊','空值','缺失','nan','NA','null','MISSING']):
         return (None, None, False, False, True)  # is_missing=True
     parts = [p.strip() for p in s.split(',')]
     if len(parts) == 1:
@@ -69,6 +72,48 @@ def assign_bin(value, bin_defs):
         if left_ok and right_ok:
             return bl
     return None
+
+
+def assign_bin_with_fallback(value, bin_defs, bin_order=None):
+    """在 assign_bin 无匹配时，按 Train 箱顺序回退到头/尾/前一箱（APPLY 常见空隙）。"""
+    assigned = assign_bin(value, bin_defs)
+    if assigned is not None:
+        return assigned
+    is_nan = value is None or (isinstance(value, float) and math.isnan(value))
+    if is_nan:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    order = list(bin_order) if bin_order else [bl for bl, _ in bin_defs]
+    numeric = []
+    meta_by_label = {bl: meta for bl, meta in bin_defs}
+    for bl in order:
+        meta = meta_by_label.get(bl)
+        if not meta or len(meta) < 5 or meta[4]:
+            continue
+        lo, hi, cl, cr, _ = meta
+        numeric.append((bl, lo, hi, cl, cr))
+    if not numeric:
+        return None
+
+    first_bl, first_lo, _, first_cl, _ = numeric[0]
+    last_bl, _, last_hi, _, last_cr = numeric[-1]
+
+    if first_lo != float('-inf'):
+        if v < first_lo or (v == first_lo and not first_cl):
+            return first_bl
+    if last_hi != float('inf'):
+        if v > last_hi or (v == last_hi and not last_cr):
+            return last_bl
+
+    for i in range(1, len(numeric)):
+        bl, lo, hi, cl, cr = numeric[i]
+        if v < lo or (v == lo and not cl):
+            return numeric[i - 1][0]
+    return last_bl
 
 def build_stability_data(data, detail, months):
     out = []

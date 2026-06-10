@@ -14,10 +14,12 @@ from services.feature_review_service import (
     _bins_for_feature_from_train_defs,
     _feature_col,
     _format_rule_display,
+    _job_has_test_split,
     _load_train_frame,
     _portfolio_stats,
     _prepare_stability_frames,
     _rule_hit_mask,
+    ensure_test_binning_aligned_for_job,
     get_chinese_name,
     read_binning_sheets,
 )
@@ -282,17 +284,6 @@ def _segment_detail_rows(rules: List[Dict[str, Any]], key: str) -> List[Dict[str
     return rows
 
 
-def _job_has_test_split(job) -> bool:
-    params = job.run_params or {}
-    if params.get("split_mode") == "manual" and params.get("test_file_path"):
-        return True
-    if params.get("split_mode") == "cutoff" and params.get("cutoff_date"):
-        return True
-    if params.get("split_mode") == "ai" and float(params.get("oot_ratio", 0.2)) > 0:
-        return True
-    return False
-
-
 def _bin_col_name(df: pd.DataFrame) -> str:
     if "Bin" in df.columns:
         return "Bin"
@@ -380,6 +371,7 @@ def _load_selected_binning_sheets(
     job = get_job(job_id)
     if not job or not job.output_path or not job.output_path.exists():
         raise ValueError("分箱任务不存在或分箱结果文件已丢失，请重新执行分箱")
+    ensure_test_binning_aligned_for_job(job_id)
     train_raw, test_raw = read_binning_sheets(str(job.output_path))
     train_sel = _sort_binning_rows(train_raw, feature_order)
     test_sel = _sort_binning_rows(test_raw, feature_order) if test_raw is not None else pd.DataFrame()

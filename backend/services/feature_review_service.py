@@ -45,6 +45,7 @@ check_u_shape = _FF.check_u_shape
 classify_category = _FF.classify_category
 parse_bin_boundary = _FF.parse_bin_boundary
 assign_bin = _FF.assign_bin
+assign_bin_with_fallback = getattr(_FF, "assign_bin_with_fallback", _FF.assign_bin)
 SUB_COLS = _FF.SUB_COLS
 SPECIAL_VALUES = getattr(_FF, "SPECIAL_VALUES", [-999, -9999, -999999])
 
@@ -217,13 +218,30 @@ def _parse_rule_from_bin(
     n_bins: int,
     rule_type: Optional[str] = None,
 ) -> Tuple[str, float]:
-    """从分箱标签推导拒绝条件（命中则拒绝）。头箱/低值坏 → <= 上界；尾箱/高值坏 → > 下界。"""
+    """从分箱标签推导拒绝条件（命中则拒绝）。头箱/低值坏 → <= 上界；尾箱/高值坏 → > 下界。连续头箱见 _parse_head_run_rule。"""
     s = str(bin_label).strip()
     if any(k in s for k in ("缺失", "nan", "NA", "特殊")):
         return ">", 0.0
 
     nums = re.findall(r"-?\d+\.?\d*", s)
     lower = s.lower()
+
+    if rule_type == "head":
+        if len(nums) >= 2:
+            return "<=", float(nums[1])
+        if nums:
+            return "<=", float(nums[0])
+        return "<=", 0.0
+
+    if rule_type == "tail":
+        if lower.endswith("inf)") or re.search(r",\s*inf\s*\)", lower):
+            lo = float(nums[0]) if nums else 0.0
+            return ">", lo
+        if len(nums) >= 2:
+            return ">", float(nums[0])
+        if nums:
+            return ">", float(nums[0])
+        return ">", 0.0
 
     # 尾箱 (X, inf) — 必须先于含 inf 的头箱判断
     if lower.endswith("inf)") or re.search(r",\s*inf\s*\)", lower):
@@ -268,6 +286,159 @@ def _parse_rule_from_bin(
             return "<=", v
         return (">", v) if bin_index >= n_bins // 2 else ("<=", v)
     return ">", 0.0
+
+
+def _bin_meets_threshold(row: pd.Series, threshold: float, min_hit: int) -> bool:
+    return int(row["total"]) >= min_hit and float(row["bad_rate"]) > threshold
+
+
+def _collect_bad_run_from_end(
+    normal: pd.DataFrame,
+    from_head: bool,
+    threshold: float,
+    min_hit: int,
+) -> List[Tuple[int, pd.Series]]:
+    """从头部或尾部收集连续超阈值的分箱。"""
+    run: List[Tuple[int, pd.Series]] = []
+    n = len(normal)
+    if from_head:
+        for i in range(n):
+            row = normal.iloc[i]
+            if _bin_meets_threshold(row, threshold, min_hit):
+                run.append((i, row))
+            else:
+                break
+    else:
+        for i in range(n - 1, -1, -1):
+            row = normal.iloc[i]
+            if _bin_meets_threshold(row, threshold, min_hit):
+                run.insert(0, (i, row))
+            else:
+                break
+    return run
+
+
+def _stats_from_bin_run(run: List[Tuple[int, pd.Series]]) -> Tuple[int, int, float]:
+    total = sum(int(r["total"]) for _, r in run)
+    bad = sum(int(r.get("bad", 0) or 0) for _, r in run)
+    if bad == 0 and total:
+        bad = sum(int(round(float(r["bad_rate"]) * int(r["total"]))) for _, r in run)
+    br = bad / total if total else 0.0
+    return total, bad, br
+
+
+def _parse_head_run_rule(
+    run: List[Tuple[int, pd.Series]], n_bins: int
+) -> Tuple[str, float]:
+    """头箱拒绝规则：单箱用 <= 上界；连续多箱用 > 首箱下界（覆盖整段坏区）。"""
+    if len(run) == 1:
+        idx, row = run[0]
+        return _parse_rule_from_bin(
+            str(row["bin_label"]), idx, n_bins, rule_type="head"
+        )
+
+    first_label = str(run[0][1]["bin_label"]).strip()
+    lower = first_label.lower()
+    nums = re.findall(r"-?\d+\.?\d*", first_label)
+    if "(-inf" not in lower and len(nums) >= 2:
+        return ">", float(nums[0])
+
+    last_label = str(run[-1][1]["bin_label"]).strip()
+    last_nums = re.findall(r"-?\d+\.?\d*", last_label)
+    if len(last_nums) >= 2:
+        return "<=", float(last_nums[1])
+    if last_nums:
+        return "<=", float(last_nums[0])
+    return "<=", 0.0
+
+
+def _format_head_tail_run_reason(
+    rtype: str,
+    run: List[Tuple[int, pd.Series]],
+    threshold: float,
+) -> str:
+    side = "头" if rtype == "head" else "尾"
+    if len(run) == 1:
+        _, r = run[0]
+        return (
+            f"{side}箱坏率{float(r['bad_rate']):.2%} > {threshold:.0%}，"
+            f"{int(r['total'])}人"
+        )
+    total, _, combined_br = _stats_from_bin_run(run)
+    bin_labels = "、".join(str(r["bin_label"]) for _, r in run)
+    return (
+        f"{side}连续{len(run)}箱超阈值（{bin_labels}），"
+        f"合并坏率{combined_br:.2%} > {threshold:.0%}，共{total}人"
+    )
+
+
+def check_head_tail_run(
+    bins_info: Dict[str, Any],
+    threshold: float,
+    min_samples: int = 20,
+) -> Optional[Tuple[str, List[str], float, int, str, str, float]]:
+    """
+    头/尾连续超阈值箱一并纳入拒绝规则（优先头箱）。
+    返回 (rtype, bin_labels, combined_br, combined_total, reason, op, threshold_val)
+    """
+    if bins_info is None or bins_info["n_normal"] < 1:
+        return None
+    normal = bins_info["normal"]
+    n = len(normal)
+
+    head_run = _collect_bad_run_from_end(normal, True, threshold, min_samples)
+    if head_run:
+        rtype, run = "head", head_run
+    else:
+        tail_run = _collect_bad_run_from_end(normal, False, threshold, min_samples)
+        if not tail_run:
+            return None
+        rtype, run = "tail", tail_run
+
+    combined_total, _, combined_br = _stats_from_bin_run(run)
+    bin_labels = [str(r["bin_label"]) for _, r in run]
+    reason = _format_head_tail_run_reason(rtype, run, threshold)
+
+    anchor_idx, anchor_row = run[0]
+    if rtype == "head":
+        op, val = _parse_head_run_rule(run, n)
+    else:
+        op, val = _parse_rule_from_bin(
+            str(anchor_row["bin_label"]), anchor_idx, n, rule_type=rtype
+        )
+    return rtype, bin_labels, combined_br, combined_total, reason, op, val
+
+
+def _is_rule_bin(
+    bl: str,
+    rule_source_bin: Optional[str],
+    rule_source_bins: Optional[List[str]] = None,
+) -> bool:
+    if rule_source_bins:
+        return bl in rule_source_bins
+    return rule_source_bin is not None and bl == rule_source_bin
+
+
+def _suggest_reject_rule_from_head_tail_run(
+    feature: str,
+    normal: pd.DataFrame,
+    threshold: float,
+    min_hit: int,
+    ht_run: Tuple[str, List[str], float, int, str, str, float],
+) -> Dict[str, Any]:
+    rtype, bin_labels, combined_br, combined_total, _, op, val = ht_run
+    meets = combined_total >= min_hit and combined_br > threshold
+    anchor = bin_labels[0]
+    return {
+        "rule_operator": op,
+        "rule_threshold": val,
+        "rule_display": f"{feature}{op}{_format_threshold(val)}",
+        "rule_source_bin": anchor,
+        "rule_source_bins": bin_labels,
+        "rule_source_bad_rate": combined_br,
+        "rule_source_obs": combined_total,
+        "rule_meets_min_hit": meets,
+    }
 
 
 def _suggest_reject_rule(
@@ -328,8 +499,9 @@ def _feature_col(df: pd.DataFrame) -> str:
 
 
 def _bin_sort_key(bl: str) -> Tuple[int, float]:
-    if any(k in bl for k in ("缺失", "nan", "NA", "特殊")):
-        return (2, 0)
+    s = str(bl).strip().lower()
+    if s.startswith("special(") or any(k in bl for k in ("缺失", "nan", "NA", "特殊")):
+        return (-1, 0)
     nums = re.findall(r"-?\d+\.?\d*", bl)
     if bl.startswith("(-inf"):
         return (0, float(nums[-1]) if nums else 0)
@@ -343,6 +515,7 @@ def _bins_for_feature(
     feat: str,
     rule_source_bin: Optional[str] = None,
     bad_rate_threshold: float = 0.0,
+    rule_source_bins: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     col = _feature_col(raw_df)
     sub = raw_df[raw_df[col] == feat].copy()
@@ -370,7 +543,7 @@ def _bins_for_feature(
             "lift": _safe_float(r.get("Lift", r.get("lift"))),
             "iv_bin": _safe_float(r.get("IV(bin)", r.get("IV(bin)"))),
             "woe": _safe_float(r.get("WOE")),
-            "is_rule_bin": rule_source_bin is not None and bl == rule_source_bin,
+            "is_rule_bin": _is_rule_bin(bl, rule_source_bin, rule_source_bins),
             "is_high_bad": br > bad_rate_threshold and not any(
                 k in bl for k in ("缺失", "nan", "NA", "特殊")
             ),
@@ -384,19 +557,35 @@ def _bins_for_feature_from_train_defs(
     feat: str,
     rule_source_bin: Optional[str] = None,
     bad_rate_threshold: float = 0.0,
+    rule_source_bins: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """用 Train 分箱边界在 Test（或其它）样本上重新统计，保证箱标签与 Train 一致。"""
-    if data.empty:
-        return []
     col = _feature_col(train_detail_df)
     bin_col = "Bin" if "Bin" in train_detail_df.columns else "bin_label"
     vd = train_detail_df[train_detail_df[col] == feat].copy()
-    if vd.empty or feat not in data.columns or "overdue_flag" not in data.columns:
+    if vd.empty:
         return []
 
     vd["_sort"] = vd[bin_col].astype(str).apply(_bin_sort_key)
     vd = vd.sort_values("_sort")
     bin_order = vd[bin_col].astype(str).tolist()
+
+    if data.empty or feat not in data.columns or "overdue_flag" not in data.columns:
+        return [
+            {
+                "bin": bl,
+                "obs": 0,
+                "bad": 0,
+                "bad_rate": 0.0,
+                "lift": None,
+                "iv_bin": None,
+                "woe": None,
+                "is_rule_bin": _is_rule_bin(bl, rule_source_bin, rule_source_bins),
+                "is_high_bad": False,
+            }
+            for bl in bin_order
+        ]
+
     bdefs = [(bl, parse_bin_boundary(bl)) for bl in bin_order]
 
     ds = data[[feat, "overdue_flag"]].copy()
@@ -406,7 +595,9 @@ def _bins_for_feature_from_train_defs(
         ds["_bin"] = ds[feat].apply(lambda v: _assign_categorical_bin(v, bin_order))
     else:
         ds[feat] = ds[feat].replace(SPECIAL_VALUES, np.nan)
-        ds["_bin"] = ds[feat].apply(lambda v: assign_bin(v, bdefs))
+        ds["_bin"] = ds[feat].apply(
+            lambda v: assign_bin_with_fallback(v, bdefs, bin_order)
+        )
         miss = ds[feat].isna()
         if miss.any():
             sp = [
@@ -432,7 +623,7 @@ def _bins_for_feature_from_train_defs(
             "lift": _safe_float(lift),
             "iv_bin": None,
             "woe": None,
-            "is_rule_bin": rule_source_bin is not None and bl == rule_source_bin,
+            "is_rule_bin": _is_rule_bin(bl, rule_source_bin, rule_source_bins),
             "is_high_bad": br > bad_rate_threshold and not any(
                 k in bl for k in ("缺失", "nan", "NA", "特殊")
             ),
@@ -440,11 +631,193 @@ def _bins_for_feature_from_train_defs(
     return rows
 
 
+def _finalize_test_bins_from_train(
+    train_bins: List[Dict[str, Any]],
+    test_bins: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """保证 Test 与 Train 箱标签、顺序完全一致；缺失箱补 0。"""
+    if not train_bins:
+        return test_bins
+    by_bin = {str(b["bin"]): b for b in test_bins}
+    out: List[Dict[str, Any]] = []
+    for tb in train_bins:
+        bl = str(tb["bin"])
+        if bl in by_bin:
+            row = dict(by_bin[bl])
+            row["bin"] = bl
+            out.append(row)
+        else:
+            out.append({
+                "bin": bl,
+                "obs": 0,
+                "bad": 0,
+                "bad_rate": 0.0,
+                "lift": None,
+                "iv_bin": None,
+                "woe": None,
+                "is_rule_bin": tb.get("is_rule_bin", False),
+                "is_high_bad": False,
+            })
+    return out
+
+
+def _bin_col_name(df: pd.DataFrame) -> str:
+    if "Bin" in df.columns:
+        return "Bin"
+    if "bin_label" in df.columns:
+        return "bin_label"
+    raise ValueError("分箱结果缺少 Bin / bin_label 列")
+
+
+def _merge_computed_bin_row(row: Dict[str, Any], computed: Dict[str, Any]) -> Dict[str, Any]:
+    """将重算后的 obs/bad/bad_rate 写回 Train 行结构（供 Test 表对齐）。"""
+    obs = int(computed.get("obs", 0) or 0)
+    bad = int(computed.get("bad", 0) or 0)
+    br = float(computed.get("bad_rate", 0) or 0)
+    row = dict(row)
+    if "#Obs" in row:
+        row["#Obs"] = obs
+        row["#Bad"] = bad
+        row["%Bad_Rate"] = br
+        if "#Good" in row:
+            row["#Good"] = obs - bad
+    else:
+        row["total"] = obs
+        row["bad"] = bad
+        row["bad_rate"] = br
+    if computed.get("lift") is not None:
+        if "Lift" in row:
+            row["Lift"] = computed["lift"]
+        elif "lift" in row:
+            row["lift"] = computed["lift"]
+    return row
+
+
+def rebuild_test_binning_sheet(
+    train_detail: pd.DataFrame,
+    test_data: pd.DataFrame,
+) -> pd.DataFrame:
+    """用 Train 分箱边界在 Test 上重算，行结构与 Train 一致（与 Step5 网页展示相同）。"""
+    if train_detail.empty or test_data.empty:
+        return pd.DataFrame()
+    col = _feature_col(train_detail)
+    bin_col = _bin_col_name(train_detail)
+    features = train_detail[col].drop_duplicates().tolist()
+    chunks: List[pd.DataFrame] = []
+    for feat in features:
+        feat_rows = train_detail[train_detail[col] == feat].copy()
+        if feat_rows.empty:
+            continue
+        feat_rows["_sort"] = feat_rows[bin_col].astype(str).apply(_bin_sort_key)
+        feat_rows = feat_rows.sort_values("_sort").drop(columns="_sort")
+        if feat not in test_data.columns:
+            computed_list = [
+                {"bin": str(r[bin_col]), "obs": 0, "bad": 0, "bad_rate": 0.0, "lift": None}
+                for _, r in feat_rows.iterrows()
+            ]
+        else:
+            computed_list = _bins_for_feature_from_train_defs(
+                test_data, train_detail, str(feat)
+            )
+        by_bin = {str(c["bin"]): c for c in computed_list}
+        rebuilt = []
+        for _, r in feat_rows.iterrows():
+            bl = str(r[bin_col])
+            computed = by_bin.get(bl, {"obs": 0, "bad": 0, "bad_rate": 0.0, "lift": None})
+            rebuilt.append(_merge_computed_bin_row(r.to_dict(), computed))
+        chunks.append(pd.DataFrame(rebuilt))
+    return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+
+
+def _load_test_frame(job_id: str) -> pd.DataFrame:
+    job = get_job(job_id)
+    if not job:
+        raise ValueError("分箱任务不存在")
+    params = job.run_params or {}
+    file_path = params.get("file_path")
+    if not file_path or not Path(file_path).exists():
+        return pd.DataFrame()
+    raw_df = read_dataframe(Path(file_path))
+    label = params.get("label") or "target"
+    _, te = _prepare_stability_frames(
+        raw_df,
+        label,
+        params.get("time_col", "apply_time"),
+        params.get("split_mode", "ai"),
+        float(params.get("oot_ratio", 0.2)),
+        params.get("cutoff_date"),
+        Path(params["train_file_path"]) if params.get("train_file_path") else None,
+        Path(params["test_file_path"]) if params.get("test_file_path") else None,
+    )
+    if te is None or te.empty:
+        return pd.DataFrame()
+    if "overdue_flag" not in te.columns and label in te.columns:
+        te = te.copy()
+        te["overdue_flag"] = _normalize_binary_label(te[label]).astype(int)
+    return te
+
+
+def _job_has_test_split(job) -> bool:
+    params = job.run_params or {}
+    if params.get("split_mode") == "manual" and params.get("test_file_path"):
+        return True
+    if params.get("split_mode") == "cutoff" and params.get("cutoff_date"):
+        return True
+    if params.get("split_mode") == "ai" and float(params.get("oot_ratio", 0.2)) > 0:
+        return True
+    return False
+
+
+def replace_test_binning_sheet_in_workbook(path: Path, test_df: pd.DataFrame) -> None:
+    """替换 Excel 中的 Test 分箱明细 Sheet，保留 Train Sheet 格式。"""
+    if test_df.empty:
+        return
+    sheet_name = "Test分箱明细"
+    with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        test_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+
+def align_test_binning_workbook(
+    path: Path,
+    test_data: pd.DataFrame,
+) -> bool:
+    """将 workbook 内 Test 分箱明细对齐为 Train 边界重算结果；成功返回 True。"""
+    if test_data.empty or not path.exists():
+        return False
+    train_raw, test_raw = read_binning_sheets(str(path))
+    if train_raw is None or train_raw.empty:
+        return False
+    if test_raw is None or test_raw.empty:
+        return False
+    aligned = rebuild_test_binning_sheet(train_raw, test_data)
+    if aligned.empty:
+        return False
+    replace_test_binning_sheet_in_workbook(path, aligned)
+    return True
+
+
+def ensure_test_binning_aligned_for_job(job_id: str) -> None:
+    """下载或串联分析前：保证 Test 分箱与网页展示一致（Train 边界 + Test 重算）。"""
+    job = get_job(job_id)
+    if not job or not job.output_path or not job.output_path.exists():
+        return
+    if not _job_has_test_split(job):
+        return
+    try:
+        te = _load_test_frame(job_id)
+        if te.empty:
+            return
+        align_test_binning_workbook(job.output_path, te)
+    except Exception:
+        return
+
+
 def _align_test_bins_to_train(
     train_bins: List[Dict[str, Any]],
     test_bins: List[Dict[str, Any]],
     rule_source_bin: Optional[str],
     bad_rate_threshold: float,
+    rule_source_bins: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Excel 对齐兜底：按 Train 箱顺序补全 Test（无原始数据时使用）。"""
     by_bin = {b["bin"]: b for b in test_bins}
@@ -463,7 +836,7 @@ def _align_test_bins_to_train(
                 "iv_bin": None,
                 "woe": None,
             }
-        row["is_rule_bin"] = rule_source_bin is not None and bl == rule_source_bin
+        row["is_rule_bin"] = _is_rule_bin(bl, rule_source_bin, rule_source_bins)
         br = float(row.get("bad_rate") or 0)
         row["is_high_bad"] = br > bad_rate_threshold and not any(
             k in bl for k in ("缺失", "nan", "NA", "特殊")
@@ -553,18 +926,16 @@ def _analyze_feature(
     max_br = float(normal["bad_rate"].max())
     cn_name = get_chinese_name(feat)
     bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
-    rule = check_head_tail(bins_info, threshold, min_samples=min_hit)
-    if not rule:
+    ht = check_head_tail_run(bins_info, threshold, min_samples=min_hit)
+    if not ht:
         return None
 
-    rtype, _bin_label, r_br, r_total, ht_reason = rule
-    hit = int(r_total)
+    rtype, _bin_labels, r_br, hit, ht_reason, _, _ = ht
     if hit < min_hit:
         return None
 
-    rule_info = _suggest_reject_rule(
-        feat, normal, threshold, min_hit,
-        rule_type=rtype, rule_bin_label=_bin_label,
+    rule_info = _suggest_reject_rule_from_head_tail_run(
+        feat, normal, threshold, min_hit, ht
     )
     u_shape = check_u_shape(bins_info, train_overall, min_samples=min_hit)
 
@@ -574,7 +945,7 @@ def _analyze_feature(
             "feature": feat,
             "chinese_name": cn_name,
             "value_type": "numeric",
-            "max_bad_rate": max_br,
+            "max_bad_rate": r_br,
             "effect_label": "U型人工判断",
             "reason": f"{ht_reason}；{u_reason}",
             "rule_type": "u_shape",
@@ -589,7 +960,7 @@ def _analyze_feature(
         "feature": feat,
         "chinese_name": cn_name,
         "value_type": "numeric",
-        "max_bad_rate": max_br,
+        "max_bad_rate": r_br,
         "effect_label": eff,
         "reason": ht_reason,
         "rule_type": rtype,
@@ -620,10 +991,10 @@ def _feature_qualifies_at_threshold(
     if len(normal) < 1:
         return None
     bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
-    rule = check_head_tail(bins_info, threshold, min_samples=min_hit)
-    if not rule:
+    ht = check_head_tail_run(bins_info, threshold, min_samples=min_hit)
+    if not ht:
         return None
-    return int(rule[3])
+    return int(ht[3])
 
 
 def _threshold_overview(
@@ -974,31 +1345,37 @@ def get_feature_detail(
             "rule_meets_min_hit": bool(high_bad_categories),
         }
         source_bin = rule_info.get("rule_source_bin")
+        source_bins = None
     else:
         bins_info = {"normal": normal, "n_normal": len(normal), "all": ft}
-        ht = check_head_tail(bins_info, bad_rate_threshold, min_samples=10)
+        ht = check_head_tail_run(bins_info, bad_rate_threshold, min_samples=10)
         if ht:
-            rtype, bin_label, _, _, _ = ht
-            rule_info = _suggest_reject_rule(
-                feature, normal, bad_rate_threshold, 10,
-                rule_type=rtype, rule_bin_label=bin_label,
+            rule_info = _suggest_reject_rule_from_head_tail_run(
+                feature, normal, bad_rate_threshold, 10, ht
             )
         else:
             rule_info = _suggest_reject_rule(feature, normal, bad_rate_threshold, 10)
         source_bin = rule_info.get("rule_source_bin")
+        source_bins = rule_info.get("rule_source_bins")
     train_bins = _bins_for_feature(
-        train_raw, feature, source_bin, bad_rate_threshold
+        train_raw, feature, source_bin, bad_rate_threshold, rule_source_bins=source_bins
     )
 
     test_bins: List[Dict[str, Any]] = []
     tr: Optional[pd.DataFrame] = None
     te: Optional[pd.DataFrame] = None
 
+    if _job_has_test_split(job):
+        try:
+            te = _load_test_frame(job_id)
+        except Exception:
+            te = pd.DataFrame()
+
     if file_path and Path(file_path).exists():
         try:
             raw_df = read_dataframe(Path(file_path))
-            label = params.get("label", "target3")
-            tr, te = _prepare_stability_frames(
+            label = params.get("label") or "target"
+            tr, te_split = _prepare_stability_frames(
                 raw_df,
                 label,
                 params.get("time_col", "apply_time"),
@@ -1008,20 +1385,41 @@ def get_feature_detail(
                 Path(params["train_file_path"]) if params.get("train_file_path") else None,
                 Path(params["test_file_path"]) if params.get("test_file_path") else None,
             )
+            if len(te_split):
+                te = te_split
             if len(te):
                 test_bins = _bins_for_feature_from_train_defs(
-                    te, train_raw, feature, source_bin, bad_rate_threshold
+                    te, train_raw, feature, source_bin, bad_rate_threshold,
+                    rule_source_bins=source_bins,
                 )
         except Exception:
-            tr, te = None, None
+            pass
+
+    if not test_bins and te is not None and len(te):
+        test_bins = _bins_for_feature_from_train_defs(
+            te, train_raw, feature, source_bin, bad_rate_threshold,
+            rule_source_bins=source_bins,
+        )
 
     if not test_bins and test_raw is not None:
         test_bins = _align_test_bins_to_train(
             train_bins,
-            _bins_for_feature(test_raw, feature, source_bin, bad_rate_threshold),
+            _bins_for_feature(
+                test_raw, feature, source_bin, bad_rate_threshold,
+                rule_source_bins=source_bins,
+            ),
             source_bin,
             bad_rate_threshold,
+            rule_source_bins=source_bins,
         )
+
+    if not test_bins and train_bins and _job_has_test_split(job):
+        test_bins = _finalize_test_bins_from_train(train_bins, [])
+
+    test_bins = _finalize_test_bins_from_train(train_bins, test_bins)
+
+    test_obs_sum = sum(int(b.get("obs") or 0) for b in test_bins)
+    test_row_count = int(len(te)) if te is not None else 0
 
     detail: Dict[str, Any] = {
         "feature": feature,
@@ -1042,6 +1440,8 @@ def get_feature_detail(
             "train": train_bins,
             "test": test_bins,
         },
+        "test_row_count": test_row_count,
+        "test_obs_sum": test_obs_sum,
         "bins_aligned_to_train": True,
     }
 
@@ -1056,7 +1456,7 @@ def get_feature_detail(
     try:
         if tr is None or te is None:
             raw_df = read_dataframe(Path(file_path))
-            label = params.get("label", "target3")
+            label = params.get("label") or "target"
             tr, te = _prepare_stability_frames(
                 raw_df,
                 label,
@@ -1069,8 +1469,10 @@ def get_feature_detail(
             )
             if len(te) and not test_bins:
                 test_bins = _bins_for_feature_from_train_defs(
-                    te, train_raw, feature, source_bin, bad_rate_threshold
+                    te, train_raw, feature, source_bin, bad_rate_threshold,
+                    rule_source_bins=source_bins,
                 )
+                test_bins = _finalize_test_bins_from_train(train_bins, test_bins)
                 detail["bins"]["test"] = test_bins
 
         train_months = [
@@ -1123,7 +1525,7 @@ def _load_train_frame(job_id: str) -> pd.DataFrame:
         raise ValueError("原始数据文件不可用，无法计算拒绝影响")
 
     raw_df = read_dataframe(Path(file_path))
-    label = params.get("label", "target3")
+    label = params.get("label") or "target"
     tr, _ = _prepare_stability_frames(
         raw_df,
         label,

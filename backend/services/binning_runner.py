@@ -329,6 +329,13 @@ def _run_quantile_or_chisquare(
     train_df = pd.concat(all_train_d5, ignore_index=True)
     test_df = pd.concat(all_test_d5, ignore_index=True) if all_test_d5 else pd.DataFrame()
 
+    if has_oot and len(test_df) > 0 and len(oot_ori) > 0:
+        from services.feature_review_service import rebuild_test_binning_sheet
+
+        te = oot_ori.copy()
+        te["overdue_flag"] = _normalize_binary_label(te[label]).astype(int)
+        test_df = rebuild_test_binning_sheet(train_df, te)
+
     writer = pd.ExcelWriter(output_file, engine="xlsxwriter")
     workbook = writer.book
 
@@ -622,6 +629,13 @@ def run_binning_job(
         )
     else:
         raise ValueError(f"未知分箱方法: {method}")
+
+    if has_oot and not oot_ori.empty:
+        from services.feature_review_service import align_test_binning_workbook
+
+        te = oot_ori.copy()
+        te["overdue_flag"] = _normalize_binary_label(te[label]).astype(int)
+        align_test_binning_workbook(output_file, te)
 
     summary["portfolio_bad_rate"] = portfolio_bad_rate
     summary["output_file"] = str(output_file.name)
