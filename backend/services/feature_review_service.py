@@ -124,9 +124,28 @@ def _is_numeric_bin_label(bl: str) -> bool:
     s = str(bl).strip()
     if s.startswith("special("):
         return False
+    if any(k in s for k in ("缺失", "nan", "NA", "特殊")):
+        return False
     if _is_interval_bin_label(s):
         return True
+    # headtail5 单值箱如 [1.0]、[2.0]
+    if (s.startswith("[") or s.startswith("(")) and re.search(r"-?\d+\.?\d*", s):
+        return True
     return bool(re.match(r"^-?\d+\.?\d*$", s))
+
+
+def _column_value_type(df: pd.DataFrame, feat: str) -> str:
+    """按原始列 dtype 判断数值/类别（与 _feature_value_type 一致）。"""
+    if feat not in df.columns:
+        return "numeric"
+    dt = df[feat].dtype
+    if (
+        pd.api.types.is_object_dtype(dt)
+        or pd.api.types.is_categorical_dtype(dt)
+        or pd.api.types.is_string_dtype(dt)
+    ):
+        return "categorical"
+    return "numeric"
 
 
 def _feature_value_type(
@@ -558,6 +577,7 @@ def _bins_for_feature_from_train_defs(
     rule_source_bin: Optional[str] = None,
     bad_rate_threshold: float = 0.0,
     rule_source_bins: Optional[List[str]] = None,
+    value_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """用 Train 分箱边界在 Test（或其它）样本上重新统计，保证箱标签与 Train 一致。"""
     col = _feature_col(train_detail_df)
@@ -590,7 +610,7 @@ def _bins_for_feature_from_train_defs(
 
     ds = data[[feat, "overdue_flag"]].copy()
     bin_order = [str(bl) for bl in bin_order]
-    use_cate = _bins_use_categorical(bin_order)
+    use_cate = (value_type or _column_value_type(data, feat)) == "categorical"
     if use_cate:
         ds["_bin"] = ds[feat].apply(lambda v: _assign_categorical_bin(v, bin_order))
     else:
@@ -708,8 +728,6 @@ def rebuild_test_binning_sheet(
         feat_rows = train_detail[train_detail[col] == feat].copy()
         if feat_rows.empty:
             continue
-        feat_rows["_sort"] = feat_rows[bin_col].astype(str).apply(_bin_sort_key)
-        feat_rows = feat_rows.sort_values("_sort").drop(columns="_sort")
         if feat not in test_data.columns:
             computed_list = [
                 {"bin": str(r[bin_col]), "obs": 0, "bad": 0, "bad_rate": 0.0, "lift": None}
@@ -1095,6 +1113,7 @@ def _stability_table(
     detail_df: pd.DataFrame,
     feature: str,
     months: List[str],
+    value_type: Optional[str] = None,
 ) -> Dict[str, Any]:
     """将 build_stability_data 输出转为前端表格结构。"""
     if data.empty or "apply_month" not in data.columns:
@@ -1114,7 +1133,7 @@ def _stability_table(
 
     ds = data[[feature, "apply_month", "overdue_flag", "money"]].copy()
     bin_order = [str(bl) for bl in bin_order]
-    if _bins_use_categorical(bin_order):
+    if (value_type or _column_value_type(data, feature)) == "categorical":
         ds["_bin"] = ds[feature].apply(lambda v: _assign_categorical_bin(v, bin_order))
     else:
         ds[feature] = ds[feature].replace(SPECIAL_VALUES, np.nan)
@@ -1390,7 +1409,7 @@ def get_feature_detail(
             if len(te):
                 test_bins = _bins_for_feature_from_train_defs(
                     te, train_raw, feature, source_bin, bad_rate_threshold,
-                    rule_source_bins=source_bins,
+                    rule_source_bins=source_bins, value_type=value_type,
                 )
         except Exception:
             pass
@@ -1398,7 +1417,7 @@ def get_feature_detail(
     if not test_bins and te is not None and len(te):
         test_bins = _bins_for_feature_from_train_defs(
             te, train_raw, feature, source_bin, bad_rate_threshold,
-            rule_source_bins=source_bins,
+            rule_source_bins=source_bins, value_type=value_type,
         )
 
     if not test_bins and test_raw is not None:
@@ -1470,7 +1489,7 @@ def get_feature_detail(
             if len(te) and not test_bins:
                 test_bins = _bins_for_feature_from_train_defs(
                     te, train_raw, feature, source_bin, bad_rate_threshold,
-                    rule_source_bins=source_bins,
+                    rule_source_bins=source_bins, value_type=value_type,
                 )
                 test_bins = _finalize_test_bins_from_train(train_bins, test_bins)
                 detail["bins"]["test"] = test_bins
@@ -1482,8 +1501,8 @@ def get_feature_detail(
             str(m) for m in sorted(te["apply_month"].dropna().unique().tolist())
         ] if len(te) and "apply_month" in te.columns else []
 
-        stab_train = _stability_table(tr, train_raw, feature, train_months)
-        stab_test = _stability_table(te, train_raw, feature, test_months)
+        stab_train = _stability_table(tr, train_raw, feature, train_months, value_type=value_type)
+        stab_test = _stability_table(te, train_raw, feature, test_months, value_type=value_type)
         detail["stability"] = {"train": stab_train, "test": stab_test}
 
         def _stab_obs(stab: Dict[str, Any]) -> int:

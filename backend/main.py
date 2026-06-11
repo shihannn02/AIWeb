@@ -43,7 +43,7 @@ app.add_middleware(
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-APP_BUILD = "20260609e"
+APP_BUILD = "20260611b"
 
 
 @app.middleware("http")

@@ -21,6 +21,8 @@ const liveFeatureStats = new Map();
 let rejectPreviewTimer = null;
 let rejectPreviewAbort = null;
 let serialAnalysisData = null;
+let currentStep = 1;
+let maxReachedStep = 1;
 /** @type {Map<string, object>} */
 const lastFeatureDetail = new Map();
 
@@ -121,9 +123,91 @@ function showView(name) {
 }
 
 function setStep(n) {
-  $$(".step-item").forEach((s) => s.classList.toggle("active", s.dataset.step === String(n)));
+  n = Number(n);
+  currentStep = n;
+  maxReachedStep = Math.max(maxReachedStep, n);
+  $$(".step-item").forEach((s) => {
+    const step = Number(s.dataset.step);
+    s.classList.toggle("active", step === n);
+    s.classList.toggle("visited", step <= maxReachedStep);
+  });
   $$(".panel").forEach((p) => p.classList.remove("active"));
   $(`#step-${n}`).classList.add("active");
+}
+
+async function navigateToStep(n) {
+  n = Number(n);
+  if (n === currentStep) return;
+
+  if (n >= 2 && !fileId) {
+    alert("请先上传数据文件");
+    return;
+  }
+  if (n >= 4 && !getStoredJobId()) {
+    alert("请先完成分箱");
+    return;
+  }
+  if (n === 6) {
+    if (!selectedFeatures.size) {
+      alert("请至少勾选一个特征");
+      return;
+    }
+    const missingCategorical = [...selectedFeatures].filter((feat) => {
+      const meta = findFeatureMetaByName(feat);
+      if (!meta || meta.value_type !== "categorical") return false;
+      const r = getFeatureRule(feat);
+      return r.operator === "in" && !(r.values?.length);
+    });
+    if (missingCategorical.length) {
+      alert(`以下类别变量尚未选择要拒绝的类别：${missingCategorical.join("、")}`);
+      return;
+    }
+    if (!buildSelectedRules().length) {
+      alert("请至少勾选一个有效规则");
+      return;
+    }
+  }
+
+  if (n === 2) {
+    setStep(2);
+    await refreshValidation();
+    return;
+  }
+  if (n === 3) {
+    const data = await refreshValidation();
+    if (data) {
+      renderRunStats(data);
+      renderRunSummary();
+    } else {
+      renderRunStats(null);
+    }
+    setStep(3);
+    return;
+  }
+  if (n === 4) {
+    currentJobId = getStoredJobId();
+    setStep(4);
+    await loadFeatureReviewSummary();
+    return;
+  }
+  if (n === 5) {
+    currentJobId = getStoredJobId();
+    setStep(5);
+    if (!reviewData?.clusters?.length) {
+      await loadFeatureReviewPick();
+    } else {
+      renderFeatureClusters(reviewData.clusters);
+      updateSelectedCount();
+      updateSelectAllCheckbox();
+    }
+    return;
+  }
+  if (n === 6) {
+    setStep(6);
+    await loadSerialAnalysis();
+    return;
+  }
+  setStep(n);
 }
 
 function logout() {
@@ -372,6 +456,14 @@ $("#split-mode").addEventListener("change", () => {
 });
 
 // Navigation
+$$(".step-item").forEach((item) => {
+  item.addEventListener("click", () => {
+    const step = Number(item.dataset.step);
+    if (step > maxReachedStep) return;
+    navigateToStep(step);
+  });
+});
+
 $("#to-step-2").addEventListener("click", async () => {
   setStep(2);
   await refreshValidation();
@@ -826,9 +918,15 @@ $("#refresh-review")?.addEventListener("click", () => loadFeatureReviewSummary()
 
 $("#clear-selected")?.addEventListener("click", () => {
   selectedFeatures.clear();
+  featureRules.clear();
+  liveFeatureStats.clear();
   syncFeatureCheckboxes();
   updateSelectedCount();
   scheduleRejectPreview();
+});
+
+$("#select-all-features")?.addEventListener("change", (e) => {
+  selectAllFeatures(e.target.checked);
 });
 
 $$(".detail-tab").forEach((btn) => {
@@ -1298,6 +1396,62 @@ function effectClass(label) {
   return "";
 }
 
+function getAllCandidateFeatures() {
+  if (!reviewData?.clusters) return [];
+  return reviewData.clusters.flatMap((g) => g.features.map((f) => f.feature));
+}
+
+function setFeatureSelected(feature, checked) {
+  if (checked) {
+    selectedFeatures.add(feature);
+    const meta = findFeatureMeta(feature);
+    if (meta?.value_type === "categorical" && !getFeatureRule(feature).userEdited) {
+      const bins = resolveHighBadBins(feature);
+      if (setCategoricalAllSelected(feature, bins)) {
+        refreshFeatureRuleLine(feature);
+        syncCategoricalDetailCheckboxes(feature);
+      }
+    }
+  } else {
+    selectedFeatures.delete(feature);
+    featureRules.delete(feature);
+    liveFeatureStats.delete(feature);
+  }
+}
+
+function updateSelectAllCheckbox() {
+  const cb = $("#select-all-features");
+  if (!cb) return;
+  const all = getAllCandidateFeatures();
+  if (!all.length) {
+    cb.checked = false;
+    cb.indeterminate = false;
+    cb.disabled = true;
+    return;
+  }
+  cb.disabled = false;
+  const n = selectedFeatures.size;
+  cb.checked = n > 0 && n === all.length;
+  cb.indeterminate = n > 0 && n < all.length;
+}
+
+function selectAllFeatures(checked) {
+  if (checked) {
+    for (const feat of getAllCandidateFeatures()) {
+      setFeatureSelected(feat, true);
+    }
+  } else {
+    selectedFeatures.clear();
+    featureRules.clear();
+    liveFeatureStats.clear();
+  }
+  syncFeatureCheckboxes();
+  updateSelectedCount();
+  updateFeatureLiveDisplays();
+  updateSelectAllCheckbox();
+  scheduleRejectPreview(checked ? undefined : null);
+}
+
 function renderFeatureClusters(clusters) {
   const el = $("#feature-clusters");
   if (!clusters?.length) {
@@ -1344,23 +1498,10 @@ function renderFeatureClusters(clusters) {
     const feat = row.dataset.feature;
     row.querySelector('input[type="checkbox"]').addEventListener("click", (e) => {
       e.stopPropagation();
-      if (e.target.checked) {
-        selectedFeatures.add(feat);
-        const meta = findFeatureMeta(feat);
-        if (meta?.value_type === "categorical" && !getFeatureRule(feat).userEdited) {
-          const bins = resolveHighBadBins(feat);
-          if (setCategoricalAllSelected(feat, bins)) {
-            refreshFeatureRuleLine(feat);
-            syncCategoricalDetailCheckboxes(feat);
-          }
-        }
-      } else {
-        selectedFeatures.delete(feat);
-        featureRules.delete(feat);
-        liveFeatureStats.delete(feat);
-      }
+      setFeatureSelected(feat, e.target.checked);
       updateSelectedCount();
       updateFeatureLiveDisplays();
+      updateSelectAllCheckbox();
       scheduleRejectPreview(selectedFeatures.size ? undefined : null);
     });
     row.addEventListener("click", (e) => {
@@ -1370,12 +1511,14 @@ function renderFeatureClusters(clusters) {
   });
 
   if (activeFeature) scheduleRejectPreview(activeFeature);
+  updateSelectAllCheckbox();
 }
 
 function syncFeatureCheckboxes() {
-  $$("#feature-clusters input[type=checkbox]").forEach((cb) => {
+  $$("#feature-clusters input[type=checkbox][data-feature]").forEach((cb) => {
     cb.checked = selectedFeatures.has(cb.dataset.feature);
   });
+  updateSelectAllCheckbox();
 }
 
 function updateSelectedCount() {

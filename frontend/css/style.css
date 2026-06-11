@@ -142,6 +142,21 @@ body {
   color: var(--muted);
   margin-bottom: .5rem;
   font-size: .9375rem;
+  transition: background .15s, color .15s;
+}
+
+.step-item.visited {
+  cursor: pointer;
+}
+
+.step-item.visited:hover:not(.active) {
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.step-item:not(.visited) {
+  cursor: default;
+  opacity: .55;
 }
 
 .step-item.active {
@@ -924,10 +939,57 @@ body {
   flex-shrink: 0;
 }
 
+.feature-list-select-all {
+  margin-right: .35rem;
+  padding: .2rem .35rem .2rem 0;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: .8125rem;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.feature-list-select-all input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--primary);
+}
+
 .feature-list-head h3 {
   font-size: .9375rem;
   font-weight: 600;
   margin: 0;
+}
+
+.select-all-features {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  font-size: .8125rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  margin-right: .25rem;
+}
+
+.select-all-features input {
+  cursor: pointer;
+}
+
+.pick-select-all {
+  padding: .375rem .75rem;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  font-size: .8125rem;
+  font-weight: 500;
+}
+
+.pick-select-all input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--primary);
 }
 
 .feature-cluster {
