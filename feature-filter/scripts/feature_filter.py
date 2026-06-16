@@ -651,17 +651,26 @@ def normalize_cols(df):
     d['bad'] = pd.to_numeric(d['bad'], errors='coerce').fillna(0).astype(int)
     def parse_min(b):
         s = str(b)
-        if any(k in s for k in ['缺失', 'nan', 'NA', '空值']): return 999999
-        if any(k in s for k in ['特殊', 'special']): return -999999
+        lower = s.lower()
+        if any(k in s for k in ['缺失', 'nan', 'NA', '空值']):
+            return 999999
+        if any(k in s for k in ['特殊', 'special']):
+            return -999999
+        if '(-inf' in lower:
+            return float('-inf')
         nums = re.findall(r'-?\d+\.?\d*', s)
         if nums:
-            v = float(nums[0])
-            if v == float('-inf') or '(-inf' in s:
-                return float(nums[1]) if len(nums) > 1 else 0
-            return v
+            return float(nums[0])
         return 0
+    def is_special_label(bl):
+        s = str(bl)
+        lower = s.lower()
+        if any(k in s for k in ['缺失', 'nan', 'NA', '空值', '特殊']):
+            return True
+        return lower.startswith('special(') or lower == 'missing'
+
     d['min_bin'] = d['bin_label'].apply(parse_min)
-    d['is_special'] = d['min_bin'].abs() > 999998
+    d['is_special'] = d['bin_label'].apply(is_special_label)
     return d
 
 

@@ -349,26 +349,21 @@ def _stats_from_bin_run(run: List[Tuple[int, pd.Series]]) -> Tuple[int, int, flo
 def _parse_head_run_rule(
     run: List[Tuple[int, pd.Series]], n_bins: int
 ) -> Tuple[str, float]:
-    """头箱拒绝规则：单箱用 <= 上界；连续多箱用 > 首箱下界（覆盖整段坏区）。"""
-    if len(run) == 1:
-        idx, row = run[0]
-        return _parse_rule_from_bin(
-            str(row["bin_label"]), idx, n_bins, rule_type="head"
-        )
+    """头箱拒绝：单箱 <= 上界；连续多箱 <= 末箱上界（如 65%+70% → 拒绝 <= 第二箱上界）。"""
+    idx, row = run[-1]
+    return _parse_rule_from_bin(
+        str(row["bin_label"]), idx, n_bins, rule_type="head"
+    )
 
-    first_label = str(run[0][1]["bin_label"]).strip()
-    lower = first_label.lower()
-    nums = re.findall(r"-?\d+\.?\d*", first_label)
-    if "(-inf" not in lower and len(nums) >= 2:
-        return ">", float(nums[0])
 
-    last_label = str(run[-1][1]["bin_label"]).strip()
-    last_nums = re.findall(r"-?\d+\.?\d*", last_label)
-    if len(last_nums) >= 2:
-        return "<=", float(last_nums[1])
-    if last_nums:
-        return "<=", float(last_nums[0])
-    return "<=", 0.0
+def _parse_tail_run_rule(
+    run: List[Tuple[int, pd.Series]], n_bins: int
+) -> Tuple[str, float]:
+    """尾箱拒绝：单箱 > 下界；连续多箱 > 首箱（靠左）下界，覆盖整段尾端坏区。"""
+    idx, row = run[0]
+    return _parse_rule_from_bin(
+        str(row["bin_label"]), idx, n_bins, rule_type="tail"
+    )
 
 
 def _format_head_tail_run_reason(
@@ -397,34 +392,38 @@ def check_head_tail_run(
     min_samples: int = 20,
 ) -> Optional[Tuple[str, List[str], float, int, str, str, float]]:
     """
-    头/尾连续超阈值箱一并纳入拒绝规则（优先头箱）。
-    返回 (rtype, bin_labels, combined_br, combined_total, reason, op, threshold_val)
+    头端：第一箱必须超阈值，且从第一箱起连续各箱均超阈值 → 候选；否则不看头端。
+    尾端：最后一箱必须超阈值，且从最后一箱起连续各箱均超阈值 → 候选；否则不看尾端。
+    中间单独飙高（如 50%→70%→40%）因第一箱/最后一箱未连续超阈值 → 不选。
     """
     if bins_info is None or bins_info["n_normal"] < 1:
         return None
     normal = bins_info["normal"]
     n = len(normal)
 
-    head_run = _collect_bad_run_from_end(normal, True, threshold, min_samples)
-    if head_run:
-        rtype, run = "head", head_run
-    else:
-        tail_run = _collect_bad_run_from_end(normal, False, threshold, min_samples)
-        if not tail_run:
+    head = normal.iloc[0]
+    if _bin_meets_threshold(head, threshold, min_samples):
+        run = _collect_bad_run_from_end(normal, True, threshold, min_samples)
+        if not run:
             return None
-        rtype, run = "tail", tail_run
+        rtype = "head"
+    else:
+        tail = normal.iloc[n - 1]
+        if not _bin_meets_threshold(tail, threshold, min_samples):
+            return None
+        run = _collect_bad_run_from_end(normal, False, threshold, min_samples)
+        if not run:
+            return None
+        rtype = "tail"
 
     combined_total, _, combined_br = _stats_from_bin_run(run)
     bin_labels = [str(r["bin_label"]) for _, r in run]
     reason = _format_head_tail_run_reason(rtype, run, threshold)
 
-    anchor_idx, anchor_row = run[0]
     if rtype == "head":
         op, val = _parse_head_run_rule(run, n)
     else:
-        op, val = _parse_rule_from_bin(
-            str(anchor_row["bin_label"]), anchor_idx, n, rule_type=rtype
-        )
+        op, val = _parse_tail_run_rule(run, n)
     return rtype, bin_labels, combined_br, combined_total, reason, op, val
 
 
