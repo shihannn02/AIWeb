@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>风控准入 · 变量分箱</title>
+  <link rel="stylesheet" href="/css/style.css?v=20260703u14" />
+</head>
+<body>
+  <div id="app">
+    <!-- Login -->
+    <section id="login-view" class="view active">
+      <div class="login-card">
+        <div class="brand">
+          <div class="brand-icon">R</div>
+          <div>
+            <h1>风控准入平台</h1>
+            <p>变量分箱 · 第一步</p>
+          </div>
+        </div>
+        <form id="login-form">
+          <label>用户名</label>
+          <input type="text" id="username" value="admin" autocomplete="username" required />
+          <label>密码</label>
+          <input type="password" id="password" value="risk123" autocomplete="current-password" required />
+          <button type="submit" class="btn primary">登录</button>
+          <p id="login-error" class="error hidden"></p>
+        </form>
+        <p class="hint">默认账号 admin / risk123，生产环境请修改环境变量</p>
+      </div>
+    </section>
+
+    <!-- Main workflow -->
+    <section id="main-view" class="view">
+      <header class="topbar">
+        <div class="brand compact">
+          <div class="brand-icon sm">R</div>
+          <span>风控准入 · 分箱</span>
+        </div>
+        <button id="logout-btn" class="btn ghost">退出</button>
+      </header>
+
+      <div class="layout">
+        <aside class="steps">
+          <div class="step-item active" data-step="1">
+            <span class="step-num">1</span>
+            <span>上传数据</span>
+          </div>
+          <div class="step-item" data-step="2">
+            <span class="step-num">2</span>
+            <span>参数配置</span>
+          </div>
+          <div class="step-item" data-step="3">
+            <span class="step-num">3</span>
+            <span>执行分箱</span>
+          </div>
+          <div class="step-item" data-step="4">
+            <span class="step-num">4</span>
+            <span>筛选概览</span>
+          </div>
+          <div class="step-item" data-step="5">
+            <span class="step-num">5</span>
+            <span>单变量挑选</span>
+          </div>
+          <div class="step-item" data-step="6">
+            <span class="step-num">6</span>
+            <span>多变量分箱</span>
+          </div>
+          <div class="step-item" data-step="7">
+            <span class="step-num">7</span>
+            <span>串联挑选</span>
+          </div>
+          <div class="step-item" data-step="8">
+            <span class="step-num">8</span>
+            <span>串联分析</span>
+          </div>
+        </aside>
+
+        <main class="content">
+          <!-- Step 1 -->
+          <div class="panel active" id="step-1">
+            <h2>上传数据文件</h2>
+            <p class="desc">支持 Excel (.xlsx/.xls) 和 CSV。上传后显示数据规模，标签与坏率在参数配置页展示。</p>
+            <div class="upload-zone" id="upload-zone">
+              <input type="file" id="file-input" accept=".xlsx,.xls,.csv" hidden />
+              <div class="upload-inner">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+                <p>拖拽文件到此处，或 <button type="button" class="link-btn" id="pick-file">点击选择</button></p>
+                <p class="sub">最大建议 200MB</p>
+              </div>
+            </div>
+            <div id="file-info" class="info-card hidden"></div>
+            <div class="actions">
+              <button id="to-step-2" class="btn primary" disabled>下一步：配置参数</button>
+            </div>
+          </div>
+
+          <!-- Step 2 -->
+          <div class="panel" id="step-2">
+            <h2>分箱参数配置</h2>
+            <p class="desc">按 zhunru 准入 SOP：一次只选一种分箱方法，Train/Test 切分三选一。</p>
+
+            <div class="form-grid">
+              <div class="field">
+                <label>逾期标签列</label>
+                <select id="label-col"></select>
+              </div>
+              <div class="field">
+                <label>时间列（OOT 切分用）</label>
+                <select id="time-col"></select>
+              </div>
+              <div class="field full">
+                <label>分箱方法 <span class="badge">三选一</span></label>
+                <div class="method-cards">
+                  <label class="method-card selected">
+                    <input type="radio" name="method" value="quantile" checked />
+                    <strong>等频分箱</strong>
+                    <span>pd.qcut，每箱样本数大致相等</span>
+                  </label>
+                  <label class="method-card">
+                    <input type="radio" name="method" value="chisquare" />
+                    <strong>卡方分箱</strong>
+                    <span>卡方合并，最大化箱间坏率差异</span>
+                  </label>
+                  <label class="method-card">
+                    <input type="radio" name="method" value="headtail5" />
+                    <strong>头尾5%分箱</strong>
+                    <span>首尾精细，识别极端风险人群</span>
+                  </label>
+                </div>
+              </div>
+              <div class="field" id="bin-num-field">
+                <label>箱数</label>
+                <input type="number" id="bin-num" value="10" min="3" max="30" />
+              </div>
+              <div class="field">
+                <label>Train/Test 切分方式</label>
+                <select id="split-mode">
+                  <option value="ai">AI 自动划分（iloc + 字符串排序）</option>
+                  <option value="cutoff">条件划分（日期截止点）</option>
+                  <option value="manual">自行划分（分别上传 train/test）</option>
+                </select>
+              </div>
+              <div class="field" id="oot-ratio-field">
+                <label>OOT 比例（Test 占比）</label>
+                <input type="number" id="oot-ratio" value="0.2" min="0" max="0.5" step="0.05" />
+                <small>0.2 = 80% Train / 20% Test；0 = 不切分</small>
+              </div>
+              <div class="field hidden" id="cutoff-field">
+                <label>日期截止点（Train &lt; 此日期）</label>
+                <input type="text" id="cutoff-date" placeholder="2026-05-01" />
+              </div>
+              <div class="field hidden full" id="manual-split-field">
+                <label>自行划分：上传 Train / Test 文件</label>
+                <div class="dual-upload">
+                  <div>
+                    <input type="file" id="train-file" accept=".xlsx,.xls,.csv" />
+                    <span id="train-file-name">未选择 Train 文件</span>
+                  </div>
+                  <div>
+                    <input type="file" id="test-file" accept=".xlsx,.xls,.csv" />
+                    <span id="test-file-name">未选择 Test 文件</span>
+                  </div>
+                </div>
+              </div>
+              <div class="field full">
+                <label>丢弃变量（不参与分箱）</label>
+                <div class="drop-cols-toolbar">
+                  <input type="search" id="drop-cols-search" placeholder="搜索变量名..." />
+                  <button type="button" class="btn ghost btn-sm" id="drop-cols-default">恢复默认</button>
+                  <button type="button" class="btn ghost btn-sm" id="drop-cols-clear">全部取消</button>
+                </div>
+                <div class="drop-cols-panel" id="drop-cols-panel"></div>
+                <small class="drop-cols-hint">已选 <strong id="drop-cols-count">0</strong> 个变量将被丢弃（标签列与切分时间列不可选）</small>
+              </div>
+            </div>
+
+            <div id="validation-info" class="info-card"></div>
+            <div class="actions">
+              <button class="btn ghost" id="back-to-1">上一步</button>
+              <button class="btn primary" id="to-step-3">下一步：执行分箱</button>
+            </div>
+          </div>
+
+          <!-- Step 3 -->
+          <div class="panel" id="step-3">
+            <h2>执行分箱</h2>
+            <p class="desc">分箱完成后进入变量筛选：设定拒绝阈值，查看推荐特征与 Train/Test 分箱、月度稳定性。</p>
+
+            <div class="run-stats-card" id="run-stats"></div>
+            <div class="summary-card" id="run-summary"></div>
+
+            <div id="progress-area" class="hidden">
+              <div class="cat-progress-card">
+                <div class="cat-progress-track">
+                  <div class="cat-progress-fill" id="progress-fill"></div>
+                  <div class="cat-walker" id="progress-cat" aria-hidden="true">🐱</div>
+                </div>
+                <p class="progress-msg">
+                  <span id="progress-text">正在分箱中</span><span id="progress-dots">...</span>
+                </p>
+                <p class="progress-hint" id="progress-hint">正在读取数据喵~</p>
+              </div>
+            </div>
+
+            <div id="result-area" class="hidden">
+              <div class="result-success">
+                <h3>分箱完成</h3>
+                <pre id="result-summary"></pre>
+                <a id="download-link" class="btn primary" href="#">下载分箱结果 Excel</a>
+              </div>
+            </div>
+
+            <div id="error-area" class="error-box hidden"></div>
+
+            <div class="actions">
+              <button class="btn ghost" id="back-to-2">上一步</button>
+              <button class="btn primary" id="run-binning">开始分箱</button>
+              <button class="btn primary hidden" id="to-step-4">下一步：筛选概览</button>
+            </div>
+          </div>
+
+          <!-- Step 4: Review summary -->
+          <div class="panel" id="step-4">
+            <h2>筛选概览 · 设定阈值</h2>
+            <p class="desc">选择筛选路径：头尾坏率（决策树支线）或 IV 等频（手动调箱支线）。两条路径在第 7 步串联挑选汇合。</p>
+
+            <div class="field full screening-branch-field">
+              <label>筛选路径</label>
+              <div class="method-cards screening-branch-cards">
+                <label class="method-card selected" data-screening-mode="bad_rate">
+                  <input type="radio" name="screening-mode" value="bad_rate" checked />
+                  <strong>头尾坏率筛选</strong>
+                  <span>数值看头/尾箱坏率，类别看超阈值档位 → 第 6 步决策树挖组合规则</span>
+                </label>
+                <label class="method-card" data-screening-mode="iv_equal_freq">
+                  <input type="radio" name="screening-mode" value="iv_equal_freq" />
+                  <strong>IV 等频筛选</strong>
+                  <span>IV(total) 达阈值 → 查看等频分箱逾期率 → 第 6 步手动调整每箱阈值</span>
+                </label>
+              </div>
+            </div>
+
+            <div id="review-controls-bad-rate" class="review-controls">
+              <div class="field">
+                <label>拒绝坏率阈值</label>
+                <input type="number" id="review-threshold" value="0.60" min="0.3" max="0.95" step="0.05" />
+                <small>头/尾箱坏率高于此值视为候选（如 0.60 = 60%）</small>
+              </div>
+              <div class="field">
+                <label>头尾拒绝最少命中人数</label>
+                <input type="number" id="review-min-hit" value="10" min="1" max="500" step="1" />
+                <small>单箱样本量下限，避免小样本噪声（建议 ≥10）</small>
+              </div>
+              <button type="button" class="btn primary" id="refresh-review">刷新统计</button>
+            </div>
+
+            <div id="review-controls-iv" class="review-controls hidden">
+              <div class="field">
+                <label>IV(total) 阈值</label>
+                <input type="number" id="review-iv-threshold" value="0.02" min="0.001" max="1" step="0.005" />
+                <small>变量 IV(total) ≥ 此值进入候选（基于第 3 步等频/分箱结果）</small>
+              </div>
+              <button type="button" class="btn primary" id="refresh-review-iv">刷新统计</button>
+            </div>
+            <p id="review-iv-method-warn" class="warn hidden">当前分箱方法非等频，IV 筛选仍可用，但建议第 2 步选择「等频分箱」以获得均匀格子。</p>
+
+            <div id="review-summary-card" class="summary-count-card hidden"></div>
+
+            <div class="manual-include-panel">
+              <h3>手动追加特征</h3>
+              <p class="sub">未达阈值的变量也可加入候选，进入下一步逐条挑选、查看分箱明细。</p>
+              <div class="manual-include-search-wrap">
+                <input type="search" id="manual-feature-search" placeholder="搜索变量英文名或中文名…" autocomplete="off" />
+                <div id="manual-feature-suggestions" class="manual-suggestions hidden"></div>
+              </div>
+              <div id="manual-include-chips" class="manual-include-chips"></div>
+            </div>
+
+            <div id="review-report" class="info-card hidden"></div>
+            <div id="threshold-overview" class="hidden"></div>
+            <div id="review-error" class="error-box hidden"></div>
+
+            <div class="actions">
+              <button class="btn ghost" id="back-to-3">返回分箱</button>
+              <button class="btn primary" id="to-step-5" disabled>下一步：单变量挑选</button>
+            </div>
+          </div>
+
+          <!-- Step 5: Feature pick -->
+          <div class="panel" id="step-5">
+            <div class="pick-header">
+              <div>
+                <h2>单变量特征挑选</h2>
+                <p class="desc">勾选 IV 达标变量（<strong>最多 6 个</strong>），第 6 步将穷举 C(n,2) 两两组合等频划格子。串联分析的单变量请在第 7 步勾选。</p>
+              </div>
+              <div class="pick-header-actions">
+                <span class="pick-selected-pill">已选 <strong id="selected-count">0</strong></span>
+                <button type="button" class="btn ghost btn-sm" id="clear-selected">清空</button>
+                <button type="button" class="btn ghost btn-sm" id="refresh-pick">刷新候选</button>
+                <button class="btn ghost btn-sm" id="back-to-4">返回概览</button>
+                <button type="button" class="btn ghost btn-sm" id="to-step-7-skip">跳过挖树，串联挑选</button>
+                <button class="btn primary btn-sm" id="to-step-6" disabled>下一步：多变量分箱</button>
+              </div>
+            </div>
+
+            <div class="pick-stage" id="pick-stage">
+              <div class="pick-top">
+                <div class="pick-top-inner">
+                  <aside class="feature-list-panel">
+                    <div class="feature-list-head">
+                      <label class="select-all-features feature-list-select-all" for="select-all-features">
+                        <input type="checkbox" id="select-all-features" aria-label="全选候选特征" />
+                        <span>全选</span>
+                      </label>
+                      <h3>候选特征</h3>
+                      <span id="review-count" class="badge" title="已选/最多">0/6</span>
+                      <div class="feature-list-sort">
+                        <label for="feature-sort">排序</label>
+                        <select id="feature-sort">
+                          <option value="bad_rate">按坏率</option>
+                          <option value="hit_count">按拒绝数量</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div id="feature-clusters" class="feature-clusters-scroll"></div>
+                  </aside>
+                  <aside class="pick-impact-panel">
+                    <div id="reject-impact-card" class="reject-impact-card">
+                      <p class="sub">勾选特征后，此处实时展示 Train 拒绝前后指标。</p>
+                    </div>
+                  </aside>
+                </div>
+              </div>
+
+              <section class="pick-bottom feature-detail-panel" id="feature-detail-panel" aria-hidden="true">
+                <div class="detail-header">
+                  <div class="detail-header-text">
+                    <h3 id="detail-title">—</h3>
+                    <p id="detail-subtitle" class="sub"></p>
+                  </div>
+                  <button type="button" class="detail-close" id="close-detail" title="收起明细">×</button>
+                </div>
+                <div class="detail-tabs">
+                  <button type="button" class="detail-tab active" data-tab="bins">Train / Test 分箱明细</button>
+                  <button type="button" class="detail-tab" data-tab="stability">Train / Test 月度稳定性</button>
+                </div>
+                <div class="detail-body">
+                  <div id="detail-bins" class="detail-tab-pane active"></div>
+                  <div id="detail-stability" class="detail-tab-pane hidden"></div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <!-- Step 6: Multivariate mining -->
+          <div class="panel" id="step-6">
+            <div id="step-6-mine-view">
+              <h2>多变量分箱</h2>
+              <p class="desc">从第 5 步已选变量中组合挖掘：可自行设定<strong>每次组合的变量数 K</strong>与<strong>决策树深度</strong>，再提取叶节点规则。</p>
+
+              <div class="mv-mine-setup info-card">
+                <h3>已选变量 <span class="badge" id="mv-pool-count">0</span></h3>
+                <div id="mv-pool-chips" class="manual-include-chips"></div>
+                <div class="mv-mine-controls mv-mine-params">
+                  <div class="field mv-mine-field">
+                    <label for="mv-k-inline">每次组合变量数 K</label>
+                    <input type="number" id="mv-k-inline" value="3" min="2" max="6" step="1" />
+                    <small>K=2 时穷举全部 C(n,2) 组合</small>
+                  </div>
+                  <div class="field mv-mine-field">
+                    <label for="mv-tree-depth">树深度 max_depth</label>
+                    <input type="number" id="mv-tree-depth" value="3" min="1" max="10" step="1" />
+                    <small>默认 3，与 notebook 一致</small>
+                  </div>
+                  <div class="mv-mine-action">
+                    <button type="button" class="btn primary" id="start-multivariate-mine">开始多变量挖掘</button>
+                  </div>
+                </div>
+              </div>
+
+              <div id="mv-mine-summary" class="info-card hidden"></div>
+              <div id="mv-mine-error" class="error-box hidden"></div>
+
+              <div id="mv-mine-progress" class="hidden">
+                <div class="cat-progress-card">
+                  <div class="cat-progress-track">
+                    <div class="cat-progress-fill" id="mv-progress-fill"></div>
+                    <div class="cat-walker" id="mv-progress-cat" aria-hidden="true">🐱</div>
+                  </div>
+                  <p class="progress-msg"><span id="mv-progress-text">多变量挖掘中</span><span id="mv-progress-dots">...</span></p>
+                  <p class="progress-hint" id="mv-progress-hint">正在组合变量并训练决策树…</p>
+                </div>
+              </div>
+
+              <div class="actions">
+                <button class="btn ghost" id="back-to-5">返回单变量</button>
+                <button class="btn primary" id="to-step-6-thresh" disabled>下一步：组合规则阈值</button>
+              </div>
+            </div>
+
+            <div id="step-6-thresh-view" class="hidden">
+              <h2>组合规则阈值 · 筛选概览</h2>
+              <p class="desc">与第 4 步单变量阈值页类似：设定组合坏率阈值与最少命中人数，查看<strong>满足所选阈值的组合规则有多少条</strong>，再进入串联挑选。挖掘与评估口径与 notebook 一致（原始变量值 + 决策树切分，不用分箱边界）。</p>
+
+              <div class="review-controls">
+                <div class="field">
+                  <label for="mv-threshold">组合坏率阈值</label>
+                  <input type="number" id="mv-threshold" value="0.35" min="0.1" max="0.95" step="0.05" />
+                  <small>全量命中样本坏率下限（非挖树条件，非 Train 单集）</small>
+                </div>
+                <div class="field">
+                  <label for="mv-min-hit">组合最少命中人数</label>
+                  <input type="number" id="mv-min-hit" value="10" min="1" max="500" step="1" />
+                  <small>组合规则全量命中样本量下限</small>
+                </div>
+                <button type="button" class="btn primary" id="refresh-mv-thresh">刷新统计</button>
+              </div>
+
+              <div id="mv-thresh-summary-card" class="summary-count-card hidden"></div>
+              <div id="mv-threshold-overview" class="hidden"></div>
+              <div id="mv-thresh-error" class="error-box hidden"></div>
+
+              <div class="actions">
+                <button class="btn ghost" id="back-to-6-mine">返回挖掘</button>
+                <button class="btn primary" id="to-step-7-from-thresh">下一步：串联挑选</button>
+              </div>
+            </div>
+
+            <div id="step-6-iv-view" class="hidden">
+              <div id="step-6-iv-coarse">
+                <h2>等频组合格子 · 初筛</h2>
+                <p class="desc">最多选 <strong>6</strong> 个变量，系统穷举全部 <strong>C(n,2)</strong> 两两组合并等频划格子（如 6 个变量 → 15 种组合）。展开每种组合可查看<strong>总览热力图</strong>与<strong>按月稳定性</strong>，勾选想要的组合进入精筛调整边界。</p>
+                <div id="iv-coarse-summary" class="summary-count-card hidden"></div>
+                <div id="iv-coarse-toolbar" class="pick-header-actions hidden">
+                  <label class="select-all-features">
+                    <input type="checkbox" id="iv-select-all-pairs" aria-label="全选组合" />
+                    <span>全选</span>
+                  </label>
+                  <span class="pick-selected-pill">已选组合 <strong id="iv-pair-selected-count">0</strong></span>
+                </div>
+                <div id="iv-coarse-list" class="iv-pair-list"></div>
+                <div id="iv-coarse-error" class="error-box hidden"></div>
+                <div class="actions">
+                  <button class="btn ghost" id="back-to-5-from-iv">返回单变量</button>
+                  <button class="btn primary" id="to-iv-fine" disabled>下一步：精筛调边界</button>
+                </div>
+              </div>
+
+              <div id="step-6-iv-fine" class="hidden">
+                <h2>等频组合格子 · 精筛</h2>
+                <p class="desc">勾选要进入串联的组合；在总览热力图中<strong>点击格子</strong>选择准入条件（可多选，<strong>每格对应第 7 步一条组合规则</strong>），可调整分箱边界后刷新格子。</p>
+                <div class="pick-stage is-split" id="iv-fine-stage">
+                  <div class="pick-top">
+                    <div class="pick-top-inner">
+                      <aside class="feature-list-panel">
+                        <div class="feature-list-head">
+                          <label class="select-all-features feature-list-select-all" for="iv-fine-select-all-pairs">
+                            <input type="checkbox" id="iv-fine-select-all-pairs" aria-label="全选精筛组合" />
+                            <span>全选</span>
+                          </label>
+                          <h3>已选组合</h3>
+                          <span id="iv-fine-pair-count" class="badge">0</span>
+                          <span class="pick-selected-pill">组合 <strong id="iv-fine-selected-count">0</strong> · 准入格 <strong id="iv-fine-cell-count">0</strong></span>
+                        </div>
+                        <div id="iv-fine-pair-list" class="feature-clusters-scroll"></div>
+                      </aside>
+                      <aside class="pick-impact-panel">
+                        <div id="iv-fine-summary" class="reject-impact-card">
+                          <p class="sub">点击左侧组合查看交叉格子热力图。</p>
+                        </div>
+                      </aside>
+                    </div>
+                  </div>
+                  <section class="pick-bottom feature-detail-panel" id="iv-fine-detail-panel">
+                    <div class="detail-header">
+                      <div class="detail-header-text">
+                        <h3 id="iv-fine-title">—</h3>
+                        <p id="iv-fine-subtitle" class="sub"></p>
+                      </div>
+                    </div>
+                    <div class="detail-body" id="iv-fine-detail-body"></div>
+                  </section>
+                </div>
+                <div class="actions">
+                  <button class="btn ghost" id="back-to-iv-coarse">返回初筛</button>
+                  <button class="btn primary" id="to-step-7-from-iv">下一步：串联挑选</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 7: Chain pick (serial singles + compound rules) -->
+          <div class="panel" id="step-7">
+            <div class="pick-header">
+              <div>
+                <h2>串联挑选</h2>
+                <p class="desc">在此勾选用于<strong>串联分析</strong>的单变量与组合规则（与第 5 步多变量挖树池独立）。右侧统一展示 Train 拒绝前后指标；点击特征/规则可查看分箱或月度热力图。</p>
+              </div>
+              <div class="pick-header-actions">
+                <span class="pick-selected-pill">单变量 <strong id="serial-selected-count">0</strong> · 准入规则 <strong id="mv-selected-count">0</strong></span>
+                <button type="button" class="btn ghost btn-sm" id="back-to-6-thresh">返回组合阈值</button>
+                <button class="btn primary btn-sm" id="to-step-8">下一步：串联分析</button>
+              </div>
+            </div>
+
+            <div id="mv-pick-error" class="error-box hidden"></div>
+
+            <div id="chain-serial-thresh-bar" class="chain-serial-thresh-bar hidden">
+              <span class="chain-serial-thresh-label">单变量筛选（IV 仅用于划格子）</span>
+              <label for="serial-pick-bad-rate-thresh">拒绝坏率 ≥</label>
+              <input type="number" id="serial-pick-bad-rate-thresh" value="0.60" min="0.3" max="0.95" step="0.05" class="input-sm" />
+              <label for="serial-pick-min-hit">最少拒绝人数 ≥</label>
+              <input type="number" id="serial-pick-min-hit" value="10" min="1" max="500" step="1" class="input-sm" />
+              <button type="button" class="btn ghost btn-sm" id="serial-pick-apply-thresh">刷新候选</button>
+              <span id="serial-pick-thresh-hint" class="sub"></span>
+            </div>
+
+            <div class="pick-stage" id="chain-pick-stage">
+              <div class="pick-top">
+                <div class="pick-top-inner chain-pick-inner">
+                  <aside class="feature-list-panel chain-list-panel">
+                    <section class="chain-list-section chain-accordion is-expanded" data-chain-accordion="single">
+                      <div class="feature-list-head chain-accordion-head" role="button" tabindex="0" aria-expanded="true" aria-controls="serial-feature-clusters">
+                        <label class="select-all-features feature-list-select-all" for="serial-select-all-features">
+                          <input type="checkbox" id="serial-select-all-features" aria-label="全选单变量候选" />
+                          <span>全选</span>
+                        </label>
+                        <h3>单变量规则</h3>
+                        <span id="serial-review-count" class="badge">0</span>
+                        <span class="chain-accordion-chevron" aria-hidden="true"></span>
+                      </div>
+                      <div id="serial-feature-clusters" class="feature-clusters-scroll chain-scroll-section chain-accordion-body">
+                        <p class="sub">加载中…</p>
+                      </div>
+                    </section>
+                    <section class="chain-list-section chain-accordion is-collapsed" data-chain-accordion="combo">
+                      <div class="feature-list-head chain-accordion-head" role="button" tabindex="0" aria-expanded="false" aria-controls="mv-rule-list">
+                        <label class="select-all-features feature-list-select-all" for="mv-select-all-rules">
+                          <input type="checkbox" id="mv-select-all-rules" aria-label="全选组合规则" />
+                          <span>全选</span>
+                        </label>
+                        <h3>组合规则</h3>
+                        <span id="mv-rule-count" class="badge">0</span>
+                        <span class="chain-accordion-chevron" aria-hidden="true"></span>
+                      </div>
+                      <div id="mv-rule-list" class="feature-clusters-scroll chain-scroll-section chain-accordion-body">
+                        <p class="sub">未挖树或无候选时此处为空；阈值请在第 6 步「组合规则阈值」页调整。</p>
+                      </div>
+                    </section>
+                  </aside>
+                  <aside class="pick-impact-panel">
+                    <div class="impact-toolbar">
+                      <label for="chain-sort">排序</label>
+                      <select id="chain-sort">
+                        <option value="bad_rate">按坏率</option>
+                        <option value="hit_count">按拒绝数量</option>
+                      </select>
+                    </div>
+                    <div id="chain-impact-card" class="reject-impact-card">
+                      <p class="sub">勾选单变量或组合规则后，此处实时展示 Train 拒绝前后指标。</p>
+                    </div>
+                  </aside>
+                </div>
+              </div>
+
+              <section class="pick-bottom feature-detail-panel" id="serial-feature-detail-panel" aria-hidden="true">
+                <div class="detail-header">
+                  <div class="detail-header-text">
+                    <h3 id="serial-pick-detail-title">—</h3>
+                    <p id="serial-pick-detail-subtitle" class="sub"></p>
+                  </div>
+                  <button type="button" class="detail-close" id="serial-pick-close-detail" title="收起明细">×</button>
+                </div>
+                <div class="detail-tabs" id="serial-pick-detail-tabs">
+                  <button type="button" class="detail-tab active" data-serial-pick-tab="bins">Train / Test 分箱明细</button>
+                  <button type="button" class="detail-tab" data-serial-pick-tab="stability">Train / Test 月度稳定性</button>
+                </div>
+                <div class="detail-body" id="serial-pick-detail-body">
+                  <div id="serial-pick-detail-bins" class="detail-tab-pane active"></div>
+                  <div id="serial-pick-detail-stability" class="detail-tab-pane hidden"></div>
+                </div>
+              </section>
+
+              <section class="pick-bottom feature-detail-panel" id="mv-detail-panel" aria-hidden="true">
+                <div class="detail-header">
+                  <div class="detail-header-text">
+                    <h3 id="mv-detail-title">—</h3>
+                    <p id="mv-detail-subtitle" class="sub"></p>
+                  </div>
+                  <button type="button" class="detail-close" id="mv-close-detail" title="收起明细">×</button>
+                </div>
+                <div class="detail-tabs">
+                  <button type="button" class="detail-tab active">Train / Test 月度稳定性</button>
+                </div>
+                <div class="detail-body">
+                  <div id="mv-detail-stability" class="detail-tab-pane active"></div>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <!-- Step 8: Serial analysis (results only) -->
+          <div class="panel" id="step-8">
+            <div class="serial-header">
+              <div>
+                <h2>串联分析</h2>
+                <p class="desc">基于第 7 步已选单变量与组合规则，计算 Train/Test/全量串联效果。点击结果表中的规则可查看明细。</p>
+              </div>
+              <div class="serial-header-actions">
+                <button class="btn ghost btn-sm" id="back-to-7">返回串联挑选</button>
+                <button class="btn ghost btn-sm" id="export-serial" disabled>导出 Excel</button>
+              </div>
+            </div>
+
+            <div id="serial-selection-summary" class="summary-count-card"></div>
+
+            <div class="serial-toolbar">
+              <label for="serial-sort">规则排序</label>
+              <select id="serial-sort">
+                <option value="selection">按挑选顺序</option>
+                <option value="bad_rate">按全量坏率</option>
+                <option value="hit_count">按全量命中数</option>
+              </select>
+              <label for="serial-lift-min">Lift 下限</label>
+              <input type="number" id="serial-lift-min" value="1.10" step="0.01" min="0" class="input-sm" />
+              <label for="serial-min-hit">最少串联命中</label>
+              <input type="number" id="serial-min-hit" value="5" step="1" min="1" class="input-sm" />
+              <button type="button" class="btn primary btn-sm" id="run-serial">重新计算</button>
+            </div>
+
+            <p id="serial-meta" class="sub"></p>
+            <div id="serial-error" class="error hidden"></div>
+            <div id="serial-summary" class="serial-summary"></div>
+            <div id="serial-rules" class="serial-rules-wrap"></div>
+
+            <section class="pick-bottom feature-detail-panel hidden" id="serial-detail-panel" aria-hidden="true">
+              <div class="detail-header">
+                <div class="detail-header-text">
+                  <h3 id="serial-detail-title">—</h3>
+                  <p id="serial-detail-subtitle" class="sub"></p>
+                </div>
+                <button type="button" class="detail-close" id="serial-close-detail" title="收起明细">×</button>
+              </div>
+              <div class="detail-tabs" id="serial-detail-tabs">
+                <button type="button" class="detail-tab active" data-serial-tab="bins">Train / Test 分箱明细</button>
+                <button type="button" class="detail-tab" data-serial-tab="stability">Train / Test 月度稳定性</button>
+              </div>
+              <div class="detail-body">
+                <div id="serial-detail-bins" class="detail-tab-pane active"></div>
+                <div id="serial-detail-stability" class="detail-tab-pane hidden"></div>
+              </div>
+            </section>
+          </div>
+        </main>
+      </div>
+    </section>
+
+    <!-- K 值确认弹窗（第 6 步） -->
+    <div id="mv-k-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="mv-k-modal-title">
+      <div class="modal-card">
+        <h3 id="mv-k-modal-title">多变量组合参数</h3>
+        <p class="desc">基于 <strong id="mv-k-feature-count">0</strong> 个单变量特征进行组合挖掘。</p>
+        <div class="field">
+          <label for="mv-k-input">每次组合变量数 K</label>
+          <input type="number" id="mv-k-input" value="3" min="2" max="6" step="1" />
+        </div>
+        <div class="field">
+          <label for="mv-k-tree-depth">树深度 max_depth</label>
+          <input type="number" id="mv-k-tree-depth" value="3" min="1" max="10" step="1" />
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn ghost" id="mv-k-cancel">取消</button>
+          <button type="button" class="btn primary" id="mv-k-confirm">开始挖掘</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <footer class="site-footer">
+    <div class="site-footer-primary">超级无敌美少女王甜恬</div>
+    <div class="site-footer-secondary">Developed by Shihan</div>
+  </footer>
+  <script src="/js/app.js?v=20260703u29"></script>
+</body>
+</html>
